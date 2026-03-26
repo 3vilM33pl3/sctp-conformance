@@ -1,6 +1,6 @@
 # Agent HTTP API
 
-The FreeBSD reference server exposes a small HTTP/JSON control plane.
+The FreeBSD reference server exposes a small HTTP/JSON control plane plus a built-in session dashboard.
 
 Health check:
 
@@ -10,13 +10,14 @@ Health check:
 
 1. `GET /v1/features`
 2. `POST /v1/sessions`
-3. `POST /v1/sessions/{sessionId}/features/{featureId}/start`
-4. Execute the SCTP scenario in the client environment
-5. Poll `GET /v1/sessions/{sessionId}/features/{featureId}`
-6. If required by the feature's `completion_mode`, call:
+3. Optional: open the returned `dashboard_path` in a browser
+4. `POST /v1/sessions/{sessionId}/features/{featureId}/start`
+5. Execute the SCTP scenario in the client environment
+6. Poll `GET /v1/sessions/{sessionId}/features/{featureId}` or watch `GET /v1/sessions/{sessionId}/summary/stream`
+7. If required by the feature's `completion_mode`, call:
    - `POST /v1/sessions/{sessionId}/features/{featureId}/complete`
    - or `POST /v1/sessions/{sessionId}/features/{featureId}/unsupported`
-7. Fetch `GET /v1/sessions/{sessionId}/summary`
+8. Fetch `GET /v1/sessions/{sessionId}/summary`
 
 ## Endpoints
 
@@ -41,6 +42,26 @@ Optional flat JSON body:
 }
 ```
 
+The response includes `session_id`, the per-feature session snapshot, and `dashboard_path`.
+
+### `GET /v1/sessions/{sessionId}`
+
+Returns the current session metadata, including:
+
+- `session_id`
+- `agent_name`
+- `environment_name`
+- `created_at`
+- `active_feature_id`
+- `dashboard_path`
+- per-feature state snapshots
+
+### `GET /sessions/{sessionId}/dashboard`
+
+Serves the built-in single-session traffic-light dashboard.
+
+The page bootstraps from `GET /v1/sessions/{sessionId}` and `GET /v1/sessions/{sessionId}/summary`, then subscribes to `GET /v1/sessions/{sessionId}/summary/stream`.
+
 ### `POST /v1/sessions/{sessionId}/features/{featureId}/start`
 
 Starts one feature in the session and returns a scenario contract containing:
@@ -64,6 +85,28 @@ Returns the per-feature state:
 - `failed`
 - `unsupported`
 - `timed_out`
+
+### `GET /v1/sessions/{sessionId}/summary`
+
+Returns the aggregate session state:
+
+- `passed`
+- `failed`
+- `unsupported`
+- `timed_out`
+- `pending`
+- `active`
+- `pending_or_active`
+- `complete`
+- `features`
+
+### `GET /v1/sessions/{sessionId}/summary/stream`
+
+Server-Sent Events endpoint that emits the full summary payload whenever the session changes.
+
+- event name: `summary`
+- data: the same JSON shape returned by `GET /v1/sessions/{sessionId}/summary`
+- idle periods: heartbeat comments are emitted to keep the connection alive
 
 ### `POST /v1/sessions/{sessionId}/features/{featureId}/complete`
 

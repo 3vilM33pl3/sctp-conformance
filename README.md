@@ -5,6 +5,7 @@ The primary interface is now a FreeBSD-resident SCTP feature server.
 The server runs against the FreeBSD reference implementation and exposes:
 
 - an HTTP/JSON control plane for feature discovery, session management, and result reporting
+- a built-in browser dashboard for live per-session traffic-light status
 - an SCTP data plane where the actual transport scenarios execute
 
 The intended workflow is:
@@ -72,12 +73,16 @@ Minimal flow:
 ```text
 GET  /v1/features
 POST /v1/sessions
+GET  /sessions/{sessionId}/dashboard
 POST /v1/sessions/{sessionId}/features/{featureId}/start
 GET  /v1/sessions/{sessionId}/features/{featureId}
+GET  /v1/sessions/{sessionId}/summary/stream
 POST /v1/sessions/{sessionId}/features/{featureId}/complete
 POST /v1/sessions/{sessionId}/features/{featureId}/unsupported
 GET  /v1/sessions/{sessionId}/summary
 ```
+
+`POST /v1/sessions` returns a `dashboard_path` for the live session board. The dashboard uses the summary snapshot and the summary SSE stream to show pending, active, passed, failed, timed-out, and unsupported feature states in realtime.
 
 The current server catalog covers:
 
@@ -125,6 +130,7 @@ The smoke test exercises:
 - one `server_observed` feature
 - one `hybrid` feature
 - one `agent_reported` feature
+- dashboard discovery and the live summary stream
 
 ## Legacy Runner
 
