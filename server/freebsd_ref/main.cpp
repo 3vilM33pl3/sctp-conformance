@@ -1,0 +1,1748 @@
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/sctp.h>
+#include <netinet/sctp_uio.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace {
+
+using Clock = std::chrono::system_clock;
+
+constexpr int kBacklog = 16;
+constexpr size_t kBufferSize = 8192;
+struct MessageSpec {
+	std::string payload;
+	uint16_t stream = 0;
+	uint32_t ppid = 0;
+};
+
+enum class CompletionMode {
+	ServerObserved,
+	AgentReported,
+	Hybrid,
+};
+
+enum class ScenarioKind {
+	AgentOnly,
+	ReceiveMessages,
+	SendAfterTrigger,
+};
+
+enum class FeatureState {
+	Pending,
+	Active,
+	Passed,
+	Failed,
+	Unsupported,
+	TimedOut,
+};
+
+struct FeatureDefinition {
+	std::string id;
+	std::string title;
+	std::string category;
+	std::string summary;
+	std::string instructions_text;
+	CompletionMode completion_mode = CompletionMode::ServerObserved;
+	ScenarioKind scenario_kind = ScenarioKind::AgentOnly;
+	int timeout_seconds = 20;
+	size_t bind_address_count = 1;
+	std::vector<std::string> client_socket_options;
+	std::vector<std::string> client_subscriptions;
+	std::vector<MessageSpec> client_send_messages;
+	std::vector<MessageSpec> server_send_messages;
+	std::string report_prompt;
+	std::string trigger_payload;
+	std::string negative_connect_target;
+	size_t expected_peer_addr_count = 0;
+};
+
+struct FeatureExecution {
+	explicit FeatureExecution(const FeatureDefinition* feature)
+	    : definition(feature)
+	{
+	}
+
+	const FeatureDefinition* definition = nullptr;
+	FeatureState state = FeatureState::Pending;
+	std::string message = "not started";
+	std::string evidence_kind;
+	std::string evidence_text;
+	std::string report_text;
+	std::string contract_json;
+	bool network_complete = false;
+	bool agent_complete = false;
+	int active_fd = -1;
+	Clock::time_point started_at {};
+	Clock::time_point deadline_at {};
+	Clock::time_point finished_at {};
+	std::mutex mutex;
+};
+
+struct Session {
+	std::string id;
+	std::string agent_name;
+	std::string environment_name;
+	Clock::time_point created_at {};
+	std::unordered_map<std::string, std::shared_ptr<FeatureExecution>> features;
+	std::string active_feature_id;
+	std::mutex mutex;
+};
+
+struct ServerOptions {
+	std::string http_host = "0.0.0.0";
+	uint16_t http_port = 8080;
+	std::vector<std::string> sctp_bind_addrs = {"127.0.0.1", "127.0.0.2"};
+	std::vector<std::string> sctp_advertise_addrs;
+};
+
+struct HttpRequest {
+	std::string method;
+	std::string path;
+	std::string body;
+	std::map<std::string, std::string> headers;
+};
+
+struct HttpResponse {
+	int status = 200;
+	std::string body;
+};
+
+struct ListeningSocket {
+	int fd = -1;
+	std::vector<std::string> bind_addrs;
+	std::vector<std::string> advertise_addrs;
+};
+
+[[nodiscard]] std::string
+trim(const std::string& value)
+{
+	size_t start = 0;
+	while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])))
+		start++;
+	size_t end = value.size();
+	while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])))
+		end--;
+	return value.substr(start, end - start);
+}
+
+[[nodiscard]] std::vector<std::string>
+split(const std::string& value, char delimiter)
+{
+	std::vector<std::string> out;
+	std::string current;
+	std::istringstream input(value);
+	while (std::getline(input, current, delimiter)) {
+		current = trim(current);
+		if (!current.empty())
+			out.push_back(current);
+	}
+	return out;
+}
+
+[[nodiscard]] std::string
+join(const std::vector<std::string>& values, const std::string& delimiter)
+{
+	std::ostringstream out;
+	for (size_t i = 0; i < values.size(); i++) {
+		if (i != 0)
+			out << delimiter;
+		out << values[i];
+	}
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_escape(const std::string& value)
+{
+	std::ostringstream out;
+	for (unsigned char ch : value) {
+		switch (ch) {
+		case '\\':
+			out << "\\\\";
+			break;
+		case '"':
+			out << "\\\"";
+			break;
+		case '\n':
+			out << "\\n";
+			break;
+		case '\r':
+			out << "\\r";
+			break;
+		case '\t':
+			out << "\\t";
+			break;
+		default:
+			if (ch < 0x20) {
+				out << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+				    << static_cast<unsigned int>(ch) << std::dec << std::setfill(' ');
+			} else {
+				out << static_cast<char>(ch);
+			}
+			break;
+		}
+	}
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_quote(const std::string& value)
+{
+	return "\"" + json_escape(value) + "\"";
+}
+
+[[nodiscard]] const char*
+to_string(CompletionMode mode)
+{
+	switch (mode) {
+	case CompletionMode::ServerObserved:
+		return "server_observed";
+	case CompletionMode::AgentReported:
+		return "agent_reported";
+	case CompletionMode::Hybrid:
+		return "hybrid";
+	}
+	return "unknown";
+}
+
+[[nodiscard]] const char*
+to_string(FeatureState state)
+{
+	switch (state) {
+	case FeatureState::Pending:
+		return "pending";
+	case FeatureState::Active:
+		return "active";
+	case FeatureState::Passed:
+		return "passed";
+	case FeatureState::Failed:
+		return "failed";
+	case FeatureState::Unsupported:
+		return "unsupported";
+	case FeatureState::TimedOut:
+		return "timed_out";
+	}
+	return "unknown";
+}
+
+[[nodiscard]] std::string
+http_status_text(int status)
+{
+	switch (status) {
+	case 200:
+		return "OK";
+	case 201:
+		return "Created";
+	case 400:
+		return "Bad Request";
+	case 404:
+		return "Not Found";
+	case 409:
+		return "Conflict";
+	case 500:
+		return "Internal Server Error";
+	default:
+		return "Status";
+	}
+}
+
+[[nodiscard]] std::string
+iso_time(const Clock::time_point& point)
+{
+	if (point.time_since_epoch().count() == 0)
+		return "";
+	const std::time_t seconds = Clock::to_time_t(point);
+	std::tm tm_value {};
+	gmtime_r(&seconds, &tm_value);
+	std::ostringstream out;
+	out << std::put_time(&tm_value, "%Y-%m-%dT%H:%M:%SZ");
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_array_strings(const std::vector<std::string>& values)
+{
+	std::ostringstream out;
+	out << "[";
+	for (size_t i = 0; i < values.size(); i++) {
+		if (i != 0)
+			out << ",";
+		out << json_quote(values[i]);
+	}
+	out << "]";
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_messages(const std::vector<MessageSpec>& values)
+{
+	std::ostringstream out;
+	out << "[";
+	for (size_t i = 0; i < values.size(); i++) {
+		if (i != 0)
+			out << ",";
+		out << "{"
+		    << "\"payload\":" << json_quote(values[i].payload) << ","
+		    << "\"stream\":" << values[i].stream << ","
+		    << "\"ppid\":" << values[i].ppid
+		    << "}";
+	}
+	out << "]";
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_error(const std::string& message)
+{
+	return std::string("{\"error\":") + json_quote(message) + "}";
+}
+
+bool
+parse_simple_json_object(const std::string& input, std::map<std::string, std::string>& out, std::string& error)
+{
+	size_t i = 0;
+	auto skip_ws = [&]() {
+		while (i < input.size() && std::isspace(static_cast<unsigned char>(input[i])))
+			i++;
+	};
+	auto parse_string = [&](std::string& out_value) -> bool {
+		if (i >= input.size() || input[i] != '"') {
+			error = "expected JSON string";
+			return false;
+		}
+		i++;
+		std::ostringstream buffer;
+		while (i < input.size()) {
+			char ch = input[i++];
+			if (ch == '"') {
+				out_value = buffer.str();
+				return true;
+			}
+			if (ch == '\\') {
+				if (i >= input.size()) {
+					error = "invalid JSON escape";
+					return false;
+				}
+				char esc = input[i++];
+				switch (esc) {
+				case '"':
+				case '\\':
+				case '/':
+					buffer << esc;
+					break;
+				case 'b':
+					buffer << '\b';
+					break;
+				case 'f':
+					buffer << '\f';
+					break;
+				case 'n':
+					buffer << '\n';
+					break;
+				case 'r':
+					buffer << '\r';
+					break;
+				case 't':
+					buffer << '\t';
+					break;
+				default:
+					error = "unsupported JSON escape";
+					return false;
+				}
+			} else {
+				buffer << ch;
+			}
+		}
+		error = "unterminated JSON string";
+		return false;
+	};
+	skip_ws();
+	if (i >= input.size() || input[i] != '{') {
+		error = "expected JSON object";
+		return false;
+	}
+	i++;
+	skip_ws();
+	if (i < input.size() && input[i] == '}')
+		return true;
+	while (i < input.size()) {
+		std::string key;
+		std::string value;
+		skip_ws();
+		if (!parse_string(key))
+			return false;
+		skip_ws();
+		if (i >= input.size() || input[i] != ':') {
+			error = "expected ':'";
+			return false;
+		}
+		i++;
+		skip_ws();
+		if (i >= input.size()) {
+			error = "expected JSON value";
+			return false;
+		}
+		if (input[i] == '"') {
+			if (!parse_string(value))
+				return false;
+		} else {
+			size_t start = i;
+			while (i < input.size() && input[i] != ',' && input[i] != '}')
+				i++;
+			value = trim(input.substr(start, i - start));
+		}
+		out[key] = value;
+		skip_ws();
+		if (i >= input.size()) {
+			error = "unterminated JSON object";
+			return false;
+		}
+		if (input[i] == '}')
+			return true;
+		if (input[i] != ',') {
+			error = "expected ','";
+			return false;
+		}
+		i++;
+	}
+	error = "unterminated JSON object";
+	return false;
+}
+
+[[nodiscard]] std::string
+format_sockaddr(const struct sockaddr* address)
+{
+	if (address == nullptr || address->sa_family != AF_INET)
+		return "";
+	char host[INET_ADDRSTRLEN] = {0};
+	const struct sockaddr_in* sin = reinterpret_cast<const struct sockaddr_in*>(address);
+	if (inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host)) == nullptr)
+		return "";
+	return std::string(host) + ":" + std::to_string(ntohs(sin->sin_port));
+}
+
+[[nodiscard]] std::vector<std::string>
+load_peer_addrs(int fd, sctp_assoc_t assoc_id)
+{
+	std::vector<std::string> out;
+	struct sockaddr* addrs = nullptr;
+	const int count = sctp_getpaddrs(fd, assoc_id, &addrs);
+	if (count <= 0 || addrs == nullptr)
+		return out;
+	struct sockaddr* current = addrs;
+	for (int i = 0; i < count; i++) {
+		std::string rendered = format_sockaddr(current);
+		if (!rendered.empty())
+			out.push_back(rendered);
+		current = reinterpret_cast<struct sockaddr*>(
+		    reinterpret_cast<char*>(current) + sctp_getaddrlen(current->sa_family));
+	}
+	sctp_freepaddrs(addrs);
+	return out;
+}
+
+[[nodiscard]] std::string
+strerror_string(int value)
+{
+	return std::string(std::strerror(value));
+}
+
+bool
+set_socket_timeout(int fd, int seconds, std::string& error)
+{
+	struct timeval timeout_value {};
+	timeout_value.tv_sec = seconds;
+	timeout_value.tv_usec = 0;
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout_value, sizeof(timeout_value)) != 0) {
+		error = strerror_string(errno);
+		return false;
+	}
+	return true;
+}
+
+bool
+apply_server_subscriptions(int fd, std::string& error)
+{
+	struct sctp_event_subscribe subscribe {};
+	int on = 1;
+	subscribe.sctp_association_event = 1;
+	subscribe.sctp_shutdown_event = 1;
+	subscribe.sctp_data_io_event = 1;
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_EVENTS, &subscribe, sizeof(subscribe)) != 0) {
+		error = strerror_string(errno);
+		return false;
+	}
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_RECVRCVINFO, &on, sizeof(on)) != 0) {
+		error = strerror_string(errno);
+		return false;
+	}
+	return true;
+}
+
+[[nodiscard]] std::vector<std::string>
+with_port(const std::vector<std::string>& addrs, uint16_t port)
+{
+	std::vector<std::string> out;
+	out.reserve(addrs.size());
+	for (const std::string& addr : addrs)
+		out.push_back(addr + ":" + std::to_string(port));
+	return out;
+}
+
+[[nodiscard]] std::string
+missing_bind_message(const std::string& address)
+{
+	if (address == "127.0.0.2")
+		return "address 127.0.0.2 is not configured on the FreeBSD host; run `ifconfig lo0 alias 127.0.0.2/8` as root";
+	return "address " + address + " is not configured on the FreeBSD host; add it to a local interface or change --sctp-addrs";
+}
+
+std::optional<ListeningSocket>
+create_listening_socket(const ServerOptions& options, size_t bind_count, int timeout_seconds, std::string& error)
+{
+	if (options.sctp_bind_addrs.size() < bind_count) {
+		error = "feature requires " + std::to_string(bind_count) +
+		    " SCTP addresses; restart the server with --sctp-addrs containing enough local addresses";
+		return std::nullopt;
+	}
+	std::vector<std::string> advertise = options.sctp_advertise_addrs.empty()
+	    ? options.sctp_bind_addrs
+	    : options.sctp_advertise_addrs;
+	if (advertise.size() < bind_count) {
+		error = "feature requires " + std::to_string(bind_count) +
+		    " advertised SCTP addresses; restart the server with --advertise-addrs containing enough addresses";
+		return std::nullopt;
+	}
+
+	int fd = socket(AF_INET, SOCK_SEQPACKET, IPPROTO_SCTP);
+	if (fd < 0) {
+		error = strerror_string(errno);
+		return std::nullopt;
+	}
+	int on = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	if (!apply_server_subscriptions(fd, error) || !set_socket_timeout(fd, timeout_seconds, error)) {
+		close(fd);
+		return std::nullopt;
+	}
+
+	std::vector<struct sockaddr_in> bind_addrs;
+	bind_addrs.reserve(bind_count);
+	for (size_t i = 0; i < bind_count; i++) {
+		struct sockaddr_in addr {};
+		addr.sin_len = sizeof(addr);
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(0);
+		if (inet_pton(AF_INET, options.sctp_bind_addrs[i].c_str(), &addr.sin_addr) != 1) {
+			close(fd);
+			error = "invalid IPv4 bind address " + options.sctp_bind_addrs[i];
+			return std::nullopt;
+		}
+		bind_addrs.push_back(addr);
+	}
+	if (bind(fd, reinterpret_cast<struct sockaddr*>(&bind_addrs[0]), sizeof(bind_addrs[0])) != 0) {
+		const int bind_errno = errno;
+		close(fd);
+		error = bind_errno == EADDRNOTAVAIL
+		    ? missing_bind_message(options.sctp_bind_addrs[0])
+		    : strerror_string(bind_errno);
+		return std::nullopt;
+	}
+	if (bind_count > 1) {
+		struct sockaddr_in actual {};
+		socklen_t actual_len = sizeof(actual);
+		if (getsockname(fd, reinterpret_cast<struct sockaddr*>(&actual), &actual_len) != 0) {
+			error = strerror_string(errno);
+			close(fd);
+			return std::nullopt;
+		}
+		std::vector<struct sockaddr_in> extra;
+		for (size_t i = 1; i < bind_count; i++) {
+			bind_addrs[i].sin_port = actual.sin_port;
+			extra.push_back(bind_addrs[i]);
+		}
+		if (sctp_bindx(fd, reinterpret_cast<struct sockaddr*>(extra.data()), static_cast<int>(extra.size()), SCTP_BINDX_ADD_ADDR) != 0) {
+			const int bind_errno = errno;
+			close(fd);
+			error = bind_errno == EADDRNOTAVAIL
+			    ? missing_bind_message(options.sctp_bind_addrs[1])
+			    : strerror_string(bind_errno);
+			return std::nullopt;
+		}
+	}
+	if (listen(fd, 8) != 0) {
+		error = strerror_string(errno);
+		close(fd);
+		return std::nullopt;
+	}
+
+	struct sockaddr_in actual {};
+	socklen_t actual_len = sizeof(actual);
+	if (getsockname(fd, reinterpret_cast<struct sockaddr*>(&actual), &actual_len) != 0) {
+		error = strerror_string(errno);
+		close(fd);
+		return std::nullopt;
+	}
+	ListeningSocket socket_info;
+	socket_info.fd = fd;
+	socket_info.bind_addrs = with_port(
+	    std::vector<std::string>(options.sctp_bind_addrs.begin(), options.sctp_bind_addrs.begin() + static_cast<long>(bind_count)),
+	    ntohs(actual.sin_port));
+	socket_info.advertise_addrs = with_port(
+	    std::vector<std::string>(advertise.begin(), advertise.begin() + static_cast<long>(bind_count)),
+	    ntohs(actual.sin_port));
+	return socket_info;
+}
+
+void
+clear_active_feature(const std::shared_ptr<Session>& session, const std::string& feature_id)
+{
+	std::lock_guard<std::mutex> session_guard(session->mutex);
+	if (session->active_feature_id == feature_id)
+		session->active_feature_id.clear();
+}
+
+void
+set_active_fd(const std::shared_ptr<FeatureExecution>& execution, int fd)
+{
+	std::lock_guard<std::mutex> lock(execution->mutex);
+	execution->active_fd = fd;
+}
+
+[[nodiscard]] int
+take_active_fd(const std::shared_ptr<FeatureExecution>& execution)
+{
+	std::lock_guard<std::mutex> lock(execution->mutex);
+	const int fd = execution->active_fd;
+	execution->active_fd = -1;
+	return fd;
+}
+
+void
+close_active_fd(const std::shared_ptr<FeatureExecution>& execution)
+{
+	const int fd = take_active_fd(execution);
+	if (fd >= 0)
+		close(fd);
+}
+
+void
+mark_failed(const std::shared_ptr<Session>& session, const std::shared_ptr<FeatureExecution>& execution, const std::string& message)
+{
+	{
+		std::lock_guard<std::mutex> lock(execution->mutex);
+		if (execution->state != FeatureState::Active)
+			return;
+		execution->state = FeatureState::Failed;
+		execution->message = message;
+		execution->finished_at = Clock::now();
+	}
+	close_active_fd(execution);
+	clear_active_feature(session, execution->definition->id);
+}
+
+void
+mark_network_complete(const std::shared_ptr<Session>& session, const std::shared_ptr<FeatureExecution>& execution)
+{
+	bool finished = false;
+	{
+		std::lock_guard<std::mutex> lock(execution->mutex);
+		if (execution->state != FeatureState::Active)
+			return;
+		execution->network_complete = true;
+		if (execution->definition->completion_mode == CompletionMode::ServerObserved || execution->agent_complete) {
+			execution->state = FeatureState::Passed;
+			execution->message = "scenario completed successfully";
+			execution->finished_at = Clock::now();
+			finished = true;
+		} else {
+			execution->message = "server observed SCTP behavior; waiting for client completion report";
+		}
+	}
+	close_active_fd(execution);
+	if (finished)
+		clear_active_feature(session, execution->definition->id);
+}
+
+void
+maybe_timeout(const std::shared_ptr<Session>& session, const std::shared_ptr<FeatureExecution>& execution)
+{
+	bool finished = false;
+	{
+		std::lock_guard<std::mutex> lock(execution->mutex);
+		if (execution->state != FeatureState::Active)
+			return;
+		if (Clock::now() < execution->deadline_at)
+			return;
+		execution->state = FeatureState::TimedOut;
+		execution->message = "scenario timed out";
+		execution->finished_at = Clock::now();
+		finished = true;
+	}
+	close_active_fd(execution);
+	if (finished)
+		clear_active_feature(session, execution->definition->id);
+}
+
+void
+run_receive_worker(
+    const std::shared_ptr<Session>& session,
+    const std::shared_ptr<FeatureExecution>& execution,
+    int fd,
+    std::vector<MessageSpec> expected_messages,
+    size_t expected_peer_addr_count)
+{
+	std::thread([session, execution, fd, expected_messages = std::move(expected_messages), expected_peer_addr_count]() {
+		char buffer[kBufferSize + 1] = {0};
+		struct iovec iov {};
+		iov.iov_base = buffer;
+		iov.iov_len = kBufferSize;
+		size_t matched = 0;
+		bool checked_peer_addrs = false;
+		while (matched < expected_messages.size()) {
+			struct sockaddr_storage from {};
+			struct sctp_rcvinfo rcvinfo {};
+			socklen_t fromlen = sizeof(from);
+			socklen_t infolen = sizeof(rcvinfo);
+			unsigned int infotype = SCTP_RECVV_RCVINFO;
+			int flags = 0;
+			const int received = static_cast<int>(sctp_recvv(
+			    fd,
+			    &iov,
+			    1,
+			    reinterpret_cast<struct sockaddr*>(&from),
+			    &fromlen,
+			    &rcvinfo,
+			    &infolen,
+			    &infotype,
+			    &flags));
+			if (received < 0) {
+				const int recv_errno = errno;
+				mark_failed(session, execution, recv_errno == EWOULDBLOCK || recv_errno == EAGAIN
+				    ? "timed out waiting for SCTP client traffic"
+				    : strerror_string(recv_errno));
+				return;
+			}
+			if ((flags & MSG_NOTIFICATION) != 0)
+				continue;
+			buffer[received] = '\0';
+			const MessageSpec& expected = expected_messages[matched];
+			if (expected.payload != buffer) {
+				mark_failed(session, execution, "unexpected payload for feature " + execution->definition->id);
+				return;
+			}
+			if (expected.stream != rcvinfo.rcv_sid) {
+				mark_failed(session, execution, "unexpected SCTP stream id");
+				return;
+			}
+			if (expected.ppid != rcvinfo.rcv_ppid) {
+				mark_failed(session, execution, "unexpected SCTP PPID");
+				return;
+			}
+			matched++;
+			if (!checked_peer_addrs && expected_peer_addr_count > 0) {
+				checked_peer_addrs = true;
+				std::vector<std::string> peer_addrs = load_peer_addrs(fd, rcvinfo.rcv_assoc_id);
+				if (peer_addrs.size() < expected_peer_addr_count) {
+					mark_failed(session, execution, "peer address enumeration did not return enough addresses");
+					return;
+				}
+			}
+		}
+		mark_network_complete(session, execution);
+	}).detach();
+}
+
+void
+run_send_after_trigger_worker(
+    const std::shared_ptr<Session>& session,
+    const std::shared_ptr<FeatureExecution>& execution,
+    int fd,
+    std::string trigger_payload,
+    std::vector<MessageSpec> server_messages)
+{
+	std::thread([session, execution, fd, trigger_payload = std::move(trigger_payload), server_messages = std::move(server_messages)]() {
+		char buffer[kBufferSize + 1] = {0};
+		struct iovec iov {};
+		iov.iov_base = buffer;
+		iov.iov_len = kBufferSize;
+		struct sockaddr_storage from {};
+		struct sctp_rcvinfo rcvinfo {};
+		socklen_t fromlen = sizeof(from);
+		socklen_t infolen = sizeof(rcvinfo);
+		unsigned int infotype = SCTP_RECVV_RCVINFO;
+		int flags = 0;
+		while (true) {
+			const int received = static_cast<int>(sctp_recvv(
+			    fd,
+			    &iov,
+			    1,
+			    reinterpret_cast<struct sockaddr*>(&from),
+			    &fromlen,
+			    &rcvinfo,
+			    &infolen,
+			    &infotype,
+			    &flags));
+			if (received < 0) {
+				const int recv_errno = errno;
+				mark_failed(session, execution, recv_errno == EWOULDBLOCK || recv_errno == EAGAIN
+				    ? "timed out waiting for trigger message"
+				    : strerror_string(recv_errno));
+				return;
+			}
+			if ((flags & MSG_NOTIFICATION) != 0)
+				continue;
+			buffer[received] = '\0';
+			if (!trigger_payload.empty() && trigger_payload != buffer) {
+				mark_failed(session, execution, "unexpected trigger payload");
+				return;
+			}
+			break;
+		}
+		for (const MessageSpec& message : server_messages) {
+			struct sctp_sndinfo sndinfo {};
+			struct iovec send_iov {};
+			send_iov.iov_base = const_cast<char*>(message.payload.data());
+			send_iov.iov_len = message.payload.size();
+			sndinfo.snd_sid = message.stream;
+			sndinfo.snd_ppid = message.ppid;
+			sndinfo.snd_assoc_id = rcvinfo.rcv_assoc_id;
+			if (sctp_sendv(fd,
+			        &send_iov,
+			        1,
+			        nullptr,
+			        0,
+			        &sndinfo,
+			        static_cast<socklen_t>(sizeof(sndinfo)),
+			        SCTP_SENDV_SNDINFO,
+			        0) < 0) {
+				const int send_errno = errno;
+				mark_failed(session, execution, strerror_string(send_errno));
+				return;
+			}
+		}
+		mark_network_complete(session, execution);
+	}).detach();
+}
+
+[[nodiscard]] FeatureDefinition
+make_agent_feature(
+    const std::string& id,
+    const std::string& title,
+    const std::string& category,
+    const std::string& summary,
+    int timeout_seconds,
+    const std::string& instructions_text,
+    const std::string& report_prompt,
+    const std::vector<std::string>& socket_options = {},
+    const std::string& negative_target = {})
+{
+	FeatureDefinition feature;
+	feature.id = id;
+	feature.title = title;
+	feature.category = category;
+	feature.summary = summary;
+	feature.instructions_text = instructions_text;
+	feature.completion_mode = CompletionMode::AgentReported;
+	feature.scenario_kind = ScenarioKind::AgentOnly;
+	feature.timeout_seconds = timeout_seconds;
+	feature.client_socket_options = socket_options;
+	feature.report_prompt = report_prompt;
+	feature.negative_connect_target = negative_target;
+	return feature;
+}
+
+[[nodiscard]] FeatureDefinition
+make_receive_feature(
+    const std::string& id,
+    const std::string& title,
+    const std::string& category,
+    const std::string& summary,
+    CompletionMode completion_mode,
+    int timeout_seconds,
+    const std::string& instructions_text,
+    const std::vector<MessageSpec>& messages,
+    const std::vector<std::string>& socket_options = {},
+    const std::vector<std::string>& subscriptions = {},
+    const std::string& report_prompt = {},
+    size_t bind_address_count = 1,
+    size_t expected_peer_addr_count = 0)
+{
+	FeatureDefinition feature;
+	feature.id = id;
+	feature.title = title;
+	feature.category = category;
+	feature.summary = summary;
+	feature.instructions_text = instructions_text;
+	feature.completion_mode = completion_mode;
+	feature.scenario_kind = ScenarioKind::ReceiveMessages;
+	feature.timeout_seconds = timeout_seconds;
+	feature.bind_address_count = bind_address_count;
+	feature.client_socket_options = socket_options;
+	feature.client_subscriptions = subscriptions;
+	feature.client_send_messages = messages;
+	feature.report_prompt = report_prompt;
+	feature.expected_peer_addr_count = expected_peer_addr_count;
+	return feature;
+}
+
+[[nodiscard]] FeatureDefinition
+make_send_feature(
+    const std::string& id,
+    const std::string& title,
+    const std::string& category,
+    const std::string& summary,
+    CompletionMode completion_mode,
+    int timeout_seconds,
+    const std::string& instructions_text,
+    const std::string& trigger_payload,
+    const std::vector<MessageSpec>& server_messages,
+    const std::vector<std::string>& subscriptions,
+    const std::string& report_prompt)
+{
+	FeatureDefinition feature;
+	feature.id = id;
+	feature.title = title;
+	feature.category = category;
+	feature.summary = summary;
+	feature.instructions_text = instructions_text;
+	feature.completion_mode = completion_mode;
+	feature.scenario_kind = ScenarioKind::SendAfterTrigger;
+	feature.timeout_seconds = timeout_seconds;
+	feature.client_subscriptions = subscriptions;
+	feature.trigger_payload = trigger_payload;
+	feature.server_send_messages = server_messages;
+	feature.report_prompt = report_prompt;
+	return feature;
+}
+
+[[nodiscard]] std::vector<FeatureDefinition>
+build_feature_catalog()
+{
+	std::vector<FeatureDefinition> features;
+	features.push_back(make_agent_feature(
+	    "socket_create",
+	    "Create SCTP socket",
+	    "endpoint",
+	    "Verify the client environment can create an SCTP socket.",
+	    20,
+	    "Create an SCTP socket in the client environment and report whether it succeeds.",
+	    "Report whether socket(AF_INET, SOCK_SEQPACKET, IPPROTO_SCTP) or the environment equivalent succeeded."));
+	features.push_back(make_receive_feature(
+	    "bind_listen_connect",
+	    "Bind, listen, and connect",
+	    "association",
+	    "Establish a basic SCTP association against the reference server.",
+	    CompletionMode::ServerObserved,
+	    20,
+	    "Connect to the server and send the exact probe payload once the association is up.",
+	    {MessageSpec{"bind-listen-connect", 0, 1}}));
+	features.push_back(make_receive_feature(
+	    "single_message_boundary",
+	    "Single message boundary",
+	    "messaging",
+	    "Send one SCTP message and preserve its boundary.",
+	    CompletionMode::ServerObserved,
+	    20,
+	    "Connect to the server and send exactly one SCTP message with the specified payload.",
+	    {MessageSpec{"single-boundary", 1, 11}}));
+	features.push_back(make_receive_feature(
+	    "multi_message_boundary",
+	    "Multiple message boundaries",
+	    "messaging",
+	    "Send two SCTP messages and preserve ordering and boundaries.",
+	    CompletionMode::ServerObserved,
+	    20,
+	    "Connect to the server and send the two messages in order as distinct SCTP messages.",
+	    {MessageSpec{"alpha", 1, 100}, MessageSpec{"beta", 1, 101}}));
+	features.push_back(make_receive_feature(
+	    "stream_id",
+	    "Stream identifier metadata",
+	    "metadata",
+	    "Deliver a message with a specific SCTP stream id.",
+	    CompletionMode::ServerObserved,
+	    20,
+	    "Connect to the server and send the message on the requested SCTP stream.",
+	    {MessageSpec{"stream-check", 7, 21}}));
+	features.push_back(make_receive_feature(
+	    "ppid",
+	    "PPID metadata",
+	    "metadata",
+	    "Deliver a message with a specific SCTP PPID.",
+	    CompletionMode::ServerObserved,
+	    20,
+	    "Connect to the server and send the message with the requested SCTP PPID.",
+	    {MessageSpec{"ppid-check", 2, 424242}}));
+	features.push_back(make_receive_feature(
+	    "nodelay",
+	    "SCTP_NODELAY",
+	    "socket_option",
+	    "Set SCTP_NODELAY before sending data.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Set SCTP_NODELAY on the client socket, connect to the server, send the probe payload, then report the local API result.",
+	    {MessageSpec{"nodelay-check", 3, 31}},
+	    {"SCTP_NODELAY"},
+	    {},
+	    "Report whether setting SCTP_NODELAY succeeded in the client environment."));
+	features.push_back(make_receive_feature(
+	    "initmsg",
+	    "SCTP_INITMSG",
+	    "socket_option",
+	    "Configure SCTP_INITMSG before association setup.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Configure SCTP_INITMSG or the environment equivalent before connecting, send the probe payload, then report the local API result.",
+	    {MessageSpec{"initmsg-check", 4, 41}},
+	    {"SCTP_INITMSG"},
+	    {},
+	    "Report the INITMSG values you attempted and whether the call succeeded."));
+	features.push_back(make_send_feature(
+	    "notifications",
+	    "Association and shutdown notifications",
+	    "events",
+	    "Subscribe to SCTP notifications and report what the client observed.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Subscribe to association, shutdown, and data I/O notifications. Connect to the server, send the trigger payload, read the server message, close gracefully, then report the notifications you observed.",
+	    "notifications-ready",
+	    {MessageSpec{"server-notify", 5, 51}},
+	    {"association", "shutdown", "dataio"},
+	    "Report the notification types observed by the client, including association and shutdown events."));
+	features.push_back(make_receive_feature(
+	    "multi_bind",
+	    "Multihome reference server",
+	    "multihoming",
+	    "Connect to a multihomed SCTP server contract if the environment supports multiple peer addresses.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "If the client environment supports multihome connect, use all advertised addresses. Otherwise declare the feature unsupported with evidence.",
+	    {MessageSpec{"multi-bind-check", 6, 61}},
+	    {},
+	    {},
+	    "Report whether the client used all advertised server addresses when creating the association.",
+	    2,
+	    0));
+	features.push_back(make_receive_feature(
+	    "local_addr_enum",
+	    "Local address enumeration",
+	    "multihoming",
+	    "Enumerate client local addresses after association setup.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Connect to the server, send the trigger payload, enumerate the local SCTP addresses in the client environment, then report them.",
+	    {MessageSpec{"local-addr-enum", 0, 71}},
+	    {},
+	    {},
+	    "Report the local addresses returned by the client environment."));
+	features.push_back(make_receive_feature(
+	    "peer_addr_enum",
+	    "Peer address enumeration",
+	    "multihoming",
+	    "Enumerate peer SCTP addresses after association setup.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Connect to the server, send the trigger payload, enumerate the peer SCTP addresses in the client environment, then report them.",
+	    {MessageSpec{"peer-addr-enum", 0, 72}},
+	    {},
+	    {},
+	    "Report the peer addresses returned by the client environment."));
+	features.push_back(make_agent_feature(
+	    "negative_connect_error",
+	    "Negative connect path",
+	    "error_path",
+	    "Attempt an invalid SCTP connection and report the failure.",
+	    20,
+	    "Attempt to connect to the provided invalid target and report the connect or first-send failure.",
+	    "Report the error surfaced by the client environment for the invalid SCTP target.",
+	    {},
+	    "0.0.0.0:1"));
+	features.push_back(make_receive_feature(
+	    "default_sndinfo",
+	    "SCTP_DEFAULT_SNDINFO",
+	    "metadata",
+	    "Set default sndinfo and send data without a per-message override.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Set SCTP_DEFAULT_SNDINFO or the environment equivalent, then send the probe payload without overriding stream or PPID per message.",
+	    {MessageSpec{"default-sndinfo", 9, 901}},
+	    {"SCTP_DEFAULT_SNDINFO"},
+	    {},
+	    "Report whether setting the default send info succeeded."));
+	features.push_back(make_send_feature(
+	    "recvnxtinfo",
+	    "SCTP_RECVNXTINFO",
+	    "metadata",
+	    "Receive two server messages and report next-message metadata from the client side.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Enable SCTP_RECVNXTINFO or the environment equivalent. Connect to the server, send the trigger payload, receive the two server messages, and report the next-message metadata you observed.",
+	    "recvnxtinfo-ready",
+	    {MessageSpec{"nxt-first", 10, 1001}, MessageSpec{"nxt-second", 11, 1002}},
+	    {},
+	    "Report the next-message metadata observed by the client while receiving the first message."));
+	features.push_back(make_agent_feature(
+	    "autoclose",
+	    "SCTP_AUTOCLOSE",
+	    "socket_option",
+	    "Attempt to configure SCTP_AUTOCLOSE on the client socket.",
+	    20,
+	    "Call SCTP_AUTOCLOSE or the environment equivalent and report whether the option is available and accepted.",
+	    "Report the AUTOCLOSE value attempted and the outcome.",
+	    {"SCTP_AUTOCLOSE"}));
+	features.push_back(make_receive_feature(
+	    "assoc_status_opt_info",
+	    "SCTP_STATUS / opt_info",
+	    "introspection",
+	    "Query association status from the client after connecting.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Connect to the server, send the probe payload, query association status through sctp_opt_info or an equivalent API, then report the result.",
+	    {MessageSpec{"assoc-status", 0, 81}},
+	    {},
+	    {},
+	    "Report whether association status information was available and summarize the returned state."));
+	return features;
+}
+
+class FeatureServer {
+public:
+	explicit FeatureServer(ServerOptions options)
+	    : options_(std::move(options))
+	    , feature_catalog_(build_feature_catalog())
+	{
+		if (options_.sctp_advertise_addrs.empty())
+			options_.sctp_advertise_addrs = options_.sctp_bind_addrs;
+		for (const FeatureDefinition& feature : feature_catalog_)
+			feature_index_[feature.id] = &feature;
+	}
+
+	int Run()
+	{
+		std::string preflight_error;
+		if (!CheckSctpAvailable(preflight_error)) {
+			std::cerr << preflight_error << "\n";
+			return 1;
+		}
+		const int listen_fd = CreateHttpSocket();
+		if (listen_fd < 0)
+			return 1;
+		std::cerr << "sctp-feature-server listening on " << options_.http_host << ":" << options_.http_port << "\n";
+		std::cerr << "advertising SCTP addresses: " << join(options_.sctp_advertise_addrs, ", ") << "\n";
+		while (true) {
+			int client_fd = accept(listen_fd, nullptr, nullptr);
+			if (client_fd < 0) {
+				if (errno == EINTR)
+					continue;
+				std::perror("accept");
+				break;
+			}
+			HandleClient(client_fd);
+			close(client_fd);
+		}
+		close(listen_fd);
+		return 1;
+	}
+
+private:
+	ServerOptions options_;
+	std::vector<FeatureDefinition> feature_catalog_;
+	std::unordered_map<std::string, const FeatureDefinition*> feature_index_;
+	std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
+	std::mutex sessions_mutex_;
+
+	bool CheckSctpAvailable(std::string& error)
+	{
+		int fd = socket(AF_INET, SOCK_SEQPACKET, IPPROTO_SCTP);
+		if (fd < 0) {
+			error = "SCTP is unavailable on this FreeBSD host. Run `kldload /boot/kernel/sctp.ko` as root and restart the server.";
+			return false;
+		}
+		close(fd);
+		return true;
+	}
+
+	int CreateHttpSocket() const
+	{
+		struct addrinfo hints {};
+		struct addrinfo* result = nullptr;
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_flags = AI_PASSIVE;
+		const std::string port = std::to_string(options_.http_port);
+		const int rc = getaddrinfo(options_.http_host == "0.0.0.0" ? nullptr : options_.http_host.c_str(), port.c_str(), &hints, &result);
+		if (rc != 0) {
+			std::cerr << "getaddrinfo: " << gai_strerror(rc) << "\n";
+			return -1;
+		}
+		int listen_fd = -1;
+		for (struct addrinfo* it = result; it != nullptr; it = it->ai_next) {
+			listen_fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+			if (listen_fd < 0)
+				continue;
+			int on = 1;
+			setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+			if (bind(listen_fd, it->ai_addr, it->ai_addrlen) == 0 && listen(listen_fd, kBacklog) == 0)
+				break;
+			close(listen_fd);
+			listen_fd = -1;
+		}
+		freeaddrinfo(result);
+		if (listen_fd < 0)
+			std::perror("bind/listen");
+		return listen_fd;
+	}
+
+	void HandleClient(int client_fd)
+	{
+		HttpRequest request;
+		std::string error;
+		if (!ReadHttpRequest(client_fd, request, error)) {
+			WriteHttpResponse(client_fd, HttpResponse{400, json_error(error)});
+			return;
+		}
+		WriteHttpResponse(client_fd, HandleRequest(request));
+	}
+
+	bool ReadHttpRequest(int client_fd, HttpRequest& request, std::string& error)
+	{
+		std::string raw;
+		std::array<char, 4096> buffer {};
+		size_t header_end = std::string::npos;
+		while ((header_end = raw.find("\r\n\r\n")) == std::string::npos) {
+			ssize_t received = read(client_fd, buffer.data(), buffer.size());
+			if (received <= 0) {
+				error = "failed to read HTTP request";
+				return false;
+			}
+			raw.append(buffer.data(), static_cast<size_t>(received));
+			if (raw.size() > 1 << 20) {
+				error = "request too large";
+				return false;
+			}
+		}
+		const std::string header_block = raw.substr(0, header_end);
+		std::istringstream header_stream(header_block);
+		std::string request_line;
+		if (!std::getline(header_stream, request_line)) {
+			error = "missing request line";
+			return false;
+		}
+		if (!request_line.empty() && request_line.back() == '\r')
+			request_line.pop_back();
+		std::istringstream request_line_stream(request_line);
+		std::string http_version;
+		if (!(request_line_stream >> request.method >> request.path >> http_version)) {
+			error = "invalid request line";
+			return false;
+		}
+		std::string header_line;
+		while (std::getline(header_stream, header_line)) {
+			if (!header_line.empty() && header_line.back() == '\r')
+				header_line.pop_back();
+			const size_t colon = header_line.find(':');
+			if (colon == std::string::npos)
+				continue;
+			std::string key = trim(header_line.substr(0, colon));
+			std::string value = trim(header_line.substr(colon + 1));
+			std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch) {
+				return static_cast<char>(std::tolower(ch));
+			});
+			request.headers[key] = value;
+		}
+		size_t content_length = 0;
+		auto header_it = request.headers.find("content-length");
+		if (header_it != request.headers.end())
+			content_length = static_cast<size_t>(std::strtoul(header_it->second.c_str(), nullptr, 10));
+		request.body = raw.substr(header_end + 4);
+		while (request.body.size() < content_length) {
+			ssize_t received = read(client_fd, buffer.data(), buffer.size());
+			if (received <= 0) {
+				error = "failed to read HTTP body";
+				return false;
+			}
+			request.body.append(buffer.data(), static_cast<size_t>(received));
+		}
+		if (request.body.size() > content_length)
+			request.body.resize(content_length);
+		return true;
+	}
+
+	void WriteHttpResponse(int client_fd, const HttpResponse& response)
+	{
+		std::ostringstream out;
+		out << "HTTP/1.1 " << response.status << " " << http_status_text(response.status) << "\r\n";
+		out << "Content-Type: application/json\r\n";
+		out << "Content-Length: " << response.body.size() << "\r\n";
+		out << "Connection: close\r\n\r\n";
+		out << response.body;
+		const std::string rendered = out.str();
+		size_t written = 0;
+		while (written < rendered.size()) {
+			ssize_t rc = write(client_fd, rendered.data() + written, rendered.size() - written);
+			if (rc <= 0)
+				break;
+			written += static_cast<size_t>(rc);
+		}
+	}
+
+	HttpResponse HandleRequest(const HttpRequest& request)
+	{
+		if (request.method == "GET" && request.path == "/healthz")
+			return {200, "{\"ok\":true}"};
+		if (request.method == "GET" && request.path == "/v1/features")
+			return {200, FeaturesJson()};
+		if (request.method == "POST" && request.path == "/v1/sessions")
+			return CreateSession(request.body);
+
+		std::vector<std::string> parts = split_path(request.path);
+		if (parts.size() >= 3 && parts[0] == "v1" && parts[1] == "sessions") {
+			std::shared_ptr<Session> session = FindSession(parts[2]);
+			if (!session)
+				return {404, json_error("unknown session")};
+			if (parts.size() == 3 && request.method == "GET")
+				return {200, SessionJson(session)};
+			if (parts.size() == 4 && parts[3] == "summary" && request.method == "GET")
+				return {200, SummaryJson(session)};
+			if (parts.size() >= 5 && parts[3] == "features") {
+				const FeatureDefinition* feature = FindFeature(parts[4]);
+				if (feature == nullptr)
+					return {404, json_error("unknown feature")};
+				std::shared_ptr<FeatureExecution> execution = session->features[feature->id];
+				maybe_timeout(session, execution);
+				if (parts.size() == 5 && request.method == "GET")
+					return {200, FeatureJson(session, execution)};
+				if (parts.size() == 6 && parts[5] == "start" && request.method == "POST")
+					return StartFeature(session, execution);
+				if (parts.size() == 6 && parts[5] == "complete" && request.method == "POST")
+					return CompleteFeature(session, execution, request.body);
+				if (parts.size() == 6 && parts[5] == "unsupported" && request.method == "POST")
+					return UnsupportedFeature(session, execution, request.body);
+			}
+		}
+		return {404, json_error("unknown route")};
+	}
+
+	std::vector<std::string> split_path(const std::string& path) const
+	{
+		std::vector<std::string> parts;
+		std::string current;
+		for (char ch : path) {
+			if (ch == '?')
+				break;
+			if (ch == '/') {
+				if (!current.empty()) {
+					parts.push_back(current);
+					current.clear();
+				}
+			} else {
+				current.push_back(ch);
+			}
+		}
+		if (!current.empty())
+			parts.push_back(current);
+		return parts;
+	}
+
+	std::shared_ptr<Session> FindSession(const std::string& id)
+	{
+		std::lock_guard<std::mutex> lock(sessions_mutex_);
+		auto it = sessions_.find(id);
+		if (it == sessions_.end())
+			return nullptr;
+		return it->second;
+	}
+
+	const FeatureDefinition* FindFeature(const std::string& id) const
+	{
+		auto it = feature_index_.find(id);
+		return it == feature_index_.end() ? nullptr : it->second;
+	}
+
+	std::string FeaturesJson() const
+	{
+		std::ostringstream out;
+		out << "{"
+		    << "\"server\":\"sctp-feature-server\","
+		    << "\"features\":[";
+		for (size_t i = 0; i < feature_catalog_.size(); i++) {
+			const FeatureDefinition& feature = feature_catalog_[i];
+			if (i != 0)
+				out << ",";
+			out << "{"
+			    << "\"id\":" << json_quote(feature.id) << ","
+			    << "\"title\":" << json_quote(feature.title) << ","
+			    << "\"category\":" << json_quote(feature.category) << ","
+			    << "\"summary\":" << json_quote(feature.summary) << ","
+			    << "\"completion_mode\":" << json_quote(to_string(feature.completion_mode)) << ","
+			    << "\"timeout_seconds\":" << feature.timeout_seconds
+			    << "}";
+		}
+		out << "]"
+		    << "}";
+		return out.str();
+	}
+
+	HttpResponse CreateSession(const std::string& body)
+	{
+		std::map<std::string, std::string> params;
+		std::string error;
+		if (!body.empty() && !parse_simple_json_object(body, params, error))
+			return {400, json_error(error)};
+		auto session = std::make_shared<Session>();
+		session->id = RandomId();
+		session->agent_name = params["agent_name"];
+		session->environment_name = params["environment_name"];
+		session->created_at = Clock::now();
+		for (const FeatureDefinition& feature : feature_catalog_)
+			session->features.emplace(feature.id, std::make_shared<FeatureExecution>(&feature));
+		{
+			std::lock_guard<std::mutex> lock(sessions_mutex_);
+			sessions_[session->id] = session;
+		}
+		return {201, SessionJson(session)};
+	}
+
+	std::string SessionJson(const std::shared_ptr<Session>& session)
+	{
+		std::lock_guard<std::mutex> lock(session->mutex);
+		std::ostringstream out;
+		out << "{"
+		    << "\"session_id\":" << json_quote(session->id) << ","
+		    << "\"agent_name\":" << json_quote(session->agent_name) << ","
+		    << "\"environment_name\":" << json_quote(session->environment_name) << ","
+		    << "\"created_at\":" << json_quote(iso_time(session->created_at)) << ","
+		    << "\"active_feature_id\":" << json_quote(session->active_feature_id) << ","
+		    << "\"features\":[";
+		bool first = true;
+		for (const FeatureDefinition& feature : feature_catalog_) {
+			if (!first)
+				out << ",";
+			first = false;
+			out << FeatureJson(session, session->features.at(feature.id), false);
+		}
+		out << "]"
+		    << "}";
+		return out.str();
+	}
+
+	std::string SummaryJson(const std::shared_ptr<Session>& session)
+	{
+		int passed = 0;
+		int failed = 0;
+		int unsupported = 0;
+		int timed_out = 0;
+		int pending = 0;
+		std::ostringstream features;
+		features << "[";
+		bool first = true;
+		for (const FeatureDefinition& feature : feature_catalog_) {
+			std::shared_ptr<FeatureExecution> execution = session->features.at(feature.id);
+			maybe_timeout(session, execution);
+			std::lock_guard<std::mutex> lock(execution->mutex);
+			switch (execution->state) {
+			case FeatureState::Passed:
+				passed++;
+				break;
+			case FeatureState::Failed:
+				failed++;
+				break;
+			case FeatureState::Unsupported:
+				unsupported++;
+				break;
+			case FeatureState::TimedOut:
+				timed_out++;
+				break;
+			case FeatureState::Pending:
+			case FeatureState::Active:
+				pending++;
+				break;
+			}
+			if (!first)
+				features << ",";
+			first = false;
+			features << FeatureJson(session, execution, false);
+		}
+		features << "]";
+		std::ostringstream out;
+		out << "{"
+		    << "\"session_id\":" << json_quote(session->id) << ","
+		    << "\"passed\":" << passed << ","
+		    << "\"failed\":" << failed << ","
+		    << "\"unsupported\":" << unsupported << ","
+		    << "\"timed_out\":" << timed_out << ","
+		    << "\"pending_or_active\":" << pending << ","
+		    << "\"complete\":" << (pending == 0 ? "true" : "false") << ","
+		    << "\"features\":" << features.str()
+		    << "}";
+		return out.str();
+	}
+
+	std::string FeatureJson(const std::shared_ptr<Session>& session, const std::shared_ptr<FeatureExecution>& execution, bool include_contract = true)
+	{
+		(void)session;
+		std::lock_guard<std::mutex> lock(execution->mutex);
+		std::ostringstream out;
+		out << "{"
+		    << "\"id\":" << json_quote(execution->definition->id) << ","
+		    << "\"title\":" << json_quote(execution->definition->title) << ","
+		    << "\"category\":" << json_quote(execution->definition->category) << ","
+		    << "\"completion_mode\":" << json_quote(to_string(execution->definition->completion_mode)) << ","
+		    << "\"state\":" << json_quote(to_string(execution->state)) << ","
+		    << "\"message\":" << json_quote(execution->message) << ","
+		    << "\"started_at\":" << json_quote(iso_time(execution->started_at)) << ","
+		    << "\"deadline_at\":" << json_quote(iso_time(execution->deadline_at)) << ","
+		    << "\"finished_at\":" << json_quote(iso_time(execution->finished_at)) << ","
+		    << "\"evidence_kind\":" << json_quote(execution->evidence_kind) << ","
+		    << "\"evidence_text\":" << json_quote(execution->evidence_text) << ","
+		    << "\"report_text\":" << json_quote(execution->report_text);
+		if (include_contract && !execution->contract_json.empty())
+			out << ",\"contract\":" << execution->contract_json;
+		out << "}";
+		return out.str();
+	}
+
+	HttpResponse StartFeature(const std::shared_ptr<Session>& session, const std::shared_ptr<FeatureExecution>& execution)
+	{
+		maybe_timeout(session, execution);
+		{
+			std::lock_guard<std::mutex> session_lock(session->mutex);
+			if (!session->active_feature_id.empty())
+				return {409, json_error("another feature is already active in this session")};
+		}
+		{
+			std::lock_guard<std::mutex> lock(execution->mutex);
+			if (execution->state != FeatureState::Pending)
+				return {409, json_error("feature has already been started in this session")};
+		}
+		std::string contract;
+		std::string error;
+		if (execution->definition->scenario_kind == ScenarioKind::AgentOnly) {
+			activate_execution(session, execution);
+			{
+				std::lock_guard<std::mutex> session_lock(session->mutex);
+				session->active_feature_id = execution->definition->id;
+			}
+			contract = build_contract(*execution->definition, {});
+		} else if (execution->definition->scenario_kind == ScenarioKind::ReceiveMessages) {
+			auto socket_info = create_listening_socket(options_, execution->definition->bind_address_count, execution->definition->timeout_seconds, error);
+			if (!socket_info)
+				return {409, json_error(error)};
+			activate_execution(session, execution);
+			set_active_fd(execution, socket_info->fd);
+			{
+				std::lock_guard<std::mutex> session_lock(session->mutex);
+				session->active_feature_id = execution->definition->id;
+			}
+			contract = build_contract(*execution->definition, socket_info->advertise_addrs);
+			run_receive_worker(session, execution, socket_info->fd, execution->definition->client_send_messages, execution->definition->expected_peer_addr_count);
+		} else {
+			auto socket_info = create_listening_socket(options_, execution->definition->bind_address_count, execution->definition->timeout_seconds, error);
+			if (!socket_info)
+				return {409, json_error(error)};
+			activate_execution(session, execution);
+			set_active_fd(execution, socket_info->fd);
+			{
+				std::lock_guard<std::mutex> session_lock(session->mutex);
+				session->active_feature_id = execution->definition->id;
+			}
+			contract = build_contract(*execution->definition, socket_info->advertise_addrs);
+			run_send_after_trigger_worker(session, execution, socket_info->fd, execution->definition->trigger_payload, execution->definition->server_send_messages);
+		}
+		{
+			std::lock_guard<std::mutex> lock(execution->mutex);
+			execution->contract_json = contract;
+		}
+		{
+			std::lock_guard<std::mutex> lock(execution->mutex);
+			if (execution->state == FeatureState::Active && execution->message == "scenario active" &&
+			    execution->definition->completion_mode == CompletionMode::AgentReported) {
+				execution->message = "waiting for client completion report";
+			}
+		}
+		return {200, FeatureJson(session, execution)};
+	}
+
+	void activate_execution(const std::shared_ptr<Session>&, const std::shared_ptr<FeatureExecution>& execution)
+	{
+		std::lock_guard<std::mutex> lock(execution->mutex);
+		execution->state = FeatureState::Active;
+		execution->message = execution->definition->completion_mode == CompletionMode::AgentReported
+		    ? "waiting for client completion report"
+		    : "scenario active";
+		execution->started_at = Clock::now();
+		execution->deadline_at = execution->started_at + std::chrono::seconds(execution->definition->timeout_seconds);
+	}
+
+	std::string build_contract(const FeatureDefinition& feature, const std::vector<std::string>& connect_addrs) const
+	{
+		std::ostringstream out;
+		out << "{"
+		    << "\"feature_id\":" << json_quote(feature.id) << ","
+		    << "\"completion_mode\":" << json_quote(to_string(feature.completion_mode)) << ","
+		    << "\"transport\":\"sctp4\","
+		    << "\"connect_addresses\":" << json_array_strings(connect_addrs) << ","
+		    << "\"client_socket_options\":" << json_array_strings(feature.client_socket_options) << ","
+		    << "\"client_subscriptions\":" << json_array_strings(feature.client_subscriptions) << ","
+		    << "\"client_send_messages\":" << json_messages(feature.client_send_messages) << ","
+		    << "\"server_send_messages\":" << json_messages(feature.server_send_messages) << ","
+		    << "\"trigger_payload\":" << json_quote(feature.trigger_payload) << ","
+		    << "\"negative_connect_target\":" << json_quote(feature.negative_connect_target) << ","
+		    << "\"timeout_seconds\":" << feature.timeout_seconds << ","
+		    << "\"report_prompt\":" << json_quote(feature.report_prompt) << ","
+		    << "\"instructions_text\":" << json_quote(feature.instructions_text)
+		    << "}";
+		return out.str();
+	}
+
+	HttpResponse CompleteFeature(const std::shared_ptr<Session>& session, const std::shared_ptr<FeatureExecution>& execution, const std::string& body)
+	{
+		maybe_timeout(session, execution);
+		std::map<std::string, std::string> params;
+		std::string error;
+		if (!parse_simple_json_object(body, params, error))
+			return {400, json_error(error)};
+		bool finished = false;
+		{
+			std::lock_guard<std::mutex> lock(execution->mutex);
+			if (execution->state != FeatureState::Active)
+				return {409, json_error("feature is not active")};
+			if (execution->definition->completion_mode == CompletionMode::ServerObserved)
+				return {409, json_error("feature does not accept client completion reports")};
+			execution->agent_complete = true;
+			execution->evidence_kind = params["evidence_kind"];
+			execution->evidence_text = params["evidence_text"];
+			execution->report_text = params["report_text"];
+			if (execution->definition->completion_mode == CompletionMode::AgentReported || execution->network_complete) {
+				execution->state = FeatureState::Passed;
+				execution->message = "scenario completed successfully";
+				execution->finished_at = Clock::now();
+				finished = true;
+			} else {
+				execution->message = "waiting for server-side SCTP observation";
+			}
+		}
+		if (finished)
+			close_active_fd(execution);
+		if (finished)
+			clear_active_feature(session, execution->definition->id);
+		return {200, FeatureJson(session, execution)};
+	}
+
+	HttpResponse UnsupportedFeature(const std::shared_ptr<Session>& session, const std::shared_ptr<FeatureExecution>& execution, const std::string& body)
+	{
+		maybe_timeout(session, execution);
+		std::map<std::string, std::string> params;
+		std::string error;
+		if (!parse_simple_json_object(body, params, error))
+			return {400, json_error(error)};
+		{
+			std::lock_guard<std::mutex> lock(execution->mutex);
+			if (execution->state == FeatureState::Passed)
+				return {409, json_error("feature already passed and cannot be marked unsupported")};
+			if (execution->state != FeatureState::Pending && execution->state != FeatureState::Active)
+				return {409, json_error("feature is already in a terminal state")};
+			execution->state = FeatureState::Unsupported;
+			execution->message = params["reason"];
+			execution->evidence_kind = params["evidence_kind"];
+			execution->evidence_text = params["evidence_text"];
+			execution->finished_at = Clock::now();
+		}
+		close_active_fd(execution);
+		clear_active_feature(session, execution->definition->id);
+		return {200, FeatureJson(session, execution)};
+	}
+
+	std::string RandomId() const
+	{
+		static constexpr char kAlphabet[] = "0123456789abcdef";
+		std::random_device device;
+		std::uniform_int_distribution<int> dist(0, 15);
+		std::string out(16, '0');
+		for (char& ch : out)
+			ch = kAlphabet[dist(device)];
+		return out;
+	}
+};
+
+bool
+parse_options(int argc, char** argv, ServerOptions& options, std::string& error)
+{
+	for (int i = 1; i < argc; i++) {
+		std::string arg = argv[i];
+		if ((arg == "--http-host" || arg == "--http-port" || arg == "--sctp-addrs" || arg == "--advertise-addrs") && i + 1 >= argc) {
+			error = "missing value for " + arg;
+			return false;
+		}
+		if (arg == "--http-host") {
+			options.http_host = argv[++i];
+		} else if (arg == "--http-port") {
+			options.http_port = static_cast<uint16_t>(std::strtoul(argv[++i], nullptr, 10));
+		} else if (arg == "--sctp-addrs") {
+			options.sctp_bind_addrs = split(argv[++i], ',');
+		} else if (arg == "--advertise-addrs") {
+			options.sctp_advertise_addrs = split(argv[++i], ',');
+		} else if (arg == "--help" || arg == "-h") {
+			std::cout
+			    << "usage: sctp-feature-server [--http-host HOST] [--http-port PORT]\n"
+			    << "                           [--sctp-addrs addr1[,addr2...]]\n"
+			    << "                           [--advertise-addrs addr1[,addr2...]]\n";
+			std::exit(0);
+		} else {
+			error = "unknown option " + arg;
+			return false;
+		}
+	}
+	if (options.sctp_bind_addrs.empty()) {
+		error = "--sctp-addrs must contain at least one IPv4 address";
+		return false;
+	}
+	if (options.sctp_advertise_addrs.empty())
+		options.sctp_advertise_addrs = options.sctp_bind_addrs;
+	return true;
+}
+
+} // namespace
+
+int
+main(int argc, char** argv)
+{
+	ServerOptions options;
+	std::string error;
+	if (!parse_options(argc, argv, options, error)) {
+		std::cerr << error << "\n";
+		return 1;
+	}
+	FeatureServer server(std::move(options));
+	return server.Run();
+}
