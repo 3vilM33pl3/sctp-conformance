@@ -135,6 +135,8 @@ struct HttpRequest {
 struct HttpResponse {
 	int status = 200;
 	std::string body;
+	std::string content_type = "application/json";
+	std::vector<std::pair<std::string, std::string>> headers;
 };
 
 struct ListeningSocket {
@@ -325,6 +327,24 @@ json_messages(const std::vector<MessageSpec>& values)
 json_error(const std::string& message)
 {
 	return std::string("{\"error\":") + json_quote(message) + "}";
+}
+
+bool
+write_all(int fd, const std::string& data)
+{
+	size_t written = 0;
+	while (written < data.size()) {
+		ssize_t rc = write(fd, data.data() + written, data.size() - written);
+		if (rc < 0) {
+			if (errno == EINTR)
+				continue;
+			return false;
+		}
+		if (rc == 0)
+			return false;
+		written += static_cast<size_t>(rc);
+	}
+	return true;
 }
 
 bool
@@ -1388,6 +1408,8 @@ private:
 			WriteHttpResponse(client_fd, HttpResponse{status, json_error(error)});
 			return;
 		}
+		if (HandleSummaryStream(client_fd, request))
+			return;
 		WriteHttpResponse(client_fd, HandleRequest(request));
 	}
 
@@ -1465,22 +1487,24 @@ private:
 	{
 		std::ostringstream out;
 		out << "HTTP/1.1 " << response.status << " " << http_status_text(response.status) << "\r\n";
-		out << "Content-Type: application/json\r\n";
+		out << "Content-Type: " << response.content_type << "\r\n";
+		for (const auto& header : response.headers)
+			out << header.first << ": " << header.second << "\r\n";
 		out << "Content-Length: " << response.body.size() << "\r\n";
 		out << "Connection: close\r\n\r\n";
 		out << response.body;
-		const std::string rendered = out.str();
-		size_t written = 0;
-		while (written < rendered.size()) {
-			ssize_t rc = write(client_fd, rendered.data() + written, rendered.size() - written);
-			if (rc <= 0)
-				break;
-			written += static_cast<size_t>(rc);
-		}
+		(void)write_all(client_fd, out.str());
 	}
 
 	HttpResponse HandleRequest(const HttpRequest& request)
 	{
+		std::vector<std::string> parts = split_path(request.path);
+		if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "dashboard" && request.method == "GET") {
+			std::shared_ptr<Session> session = FindSession(parts[1]);
+			if (!session)
+				return {404, json_error("unknown session")};
+			return {200, DashboardHtml(session), "text/html; charset=utf-8"};
+		}
 		if (request.method == "GET" && request.path == "/healthz")
 			return {200, "{\"ok\":true}"};
 		if (request.method == "GET" && request.path == "/v1/features")
@@ -1488,7 +1512,6 @@ private:
 		if (request.method == "POST" && request.path == "/v1/sessions")
 			return CreateSession(request.body);
 
-		std::vector<std::string> parts = split_path(request.path);
 		if (parts.size() >= 3 && parts[0] == "v1" && parts[1] == "sessions") {
 			std::shared_ptr<Session> session = FindSession(parts[2]);
 			if (!session)
@@ -1606,6 +1629,7 @@ private:
 		    << "\"environment_name\":" << json_quote(session->environment_name) << ","
 		    << "\"created_at\":" << json_quote(iso_time(session->created_at)) << ","
 		    << "\"active_feature_id\":" << json_quote(session->active_feature_id) << ","
+		    << "\"dashboard_path\":" << json_quote(DashboardPath(session->id)) << ","
 		    << "\"features\":[";
 		bool first = true;
 		for (const FeatureDefinition& feature : feature_catalog_) {
@@ -1626,6 +1650,7 @@ private:
 		int unsupported = 0;
 		int timed_out = 0;
 		int pending = 0;
+		int active = 0;
 		std::ostringstream features;
 		features << "[";
 		bool first = true;
@@ -1647,14 +1672,16 @@ private:
 				timed_out++;
 				break;
 			case FeatureState::Pending:
-			case FeatureState::Active:
 				pending++;
+				break;
+			case FeatureState::Active:
+				active++;
 				break;
 			}
 			if (!first)
 				features << ",";
 			first = false;
-			features << FeatureJson(session, execution, false);
+			features << FeatureJsonLocked(execution, false);
 		}
 		features << "]";
 		std::ostringstream out;
@@ -1664,17 +1691,17 @@ private:
 		    << "\"failed\":" << failed << ","
 		    << "\"unsupported\":" << unsupported << ","
 		    << "\"timed_out\":" << timed_out << ","
-		    << "\"pending_or_active\":" << pending << ","
-		    << "\"complete\":" << (pending == 0 ? "true" : "false") << ","
+		    << "\"pending\":" << pending << ","
+		    << "\"active\":" << active << ","
+		    << "\"pending_or_active\":" << (pending + active) << ","
+		    << "\"complete\":" << (pending == 0 && active == 0 ? "true" : "false") << ","
 		    << "\"features\":" << features.str()
 		    << "}";
 		return out.str();
 	}
 
-	std::string FeatureJson(const std::shared_ptr<Session>& session, const std::shared_ptr<FeatureExecution>& execution, bool include_contract = true)
+	std::string FeatureJsonLocked(const std::shared_ptr<FeatureExecution>& execution, bool include_contract = true)
 	{
-		(void)session;
-		std::lock_guard<std::mutex> lock(execution->mutex);
 		std::ostringstream out;
 		out << "{"
 		    << "\"id\":" << json_quote(execution->definition->id) << ","
@@ -1692,6 +1719,596 @@ private:
 		if (include_contract && !execution->contract_json.empty())
 			out << ",\"contract\":" << execution->contract_json;
 		out << "}";
+		return out.str();
+	}
+
+	std::string FeatureJson(const std::shared_ptr<Session>& session, const std::shared_ptr<FeatureExecution>& execution, bool include_contract = true)
+	{
+		(void)session;
+		std::lock_guard<std::mutex> lock(execution->mutex);
+		return FeatureJsonLocked(execution, include_contract);
+	}
+
+	std::string DashboardPath(const std::string& session_id) const
+	{
+		return "/sessions/" + session_id + "/dashboard";
+	}
+
+	std::string SessionApiPath(const std::string& session_id) const
+	{
+		return "/v1/sessions/" + session_id;
+	}
+
+	std::string SummaryPath(const std::string& session_id) const
+	{
+		return SessionApiPath(session_id) + "/summary";
+	}
+
+	std::string SummaryStreamPath(const std::string& session_id) const
+	{
+		return SummaryPath(session_id) + "/stream";
+	}
+
+	bool HandleSummaryStream(int client_fd, const HttpRequest& request)
+	{
+		if (request.method != "GET")
+			return false;
+		std::vector<std::string> parts = split_path(request.path);
+		if (parts.size() != 5 || parts[0] != "v1" || parts[1] != "sessions" || parts[3] != "summary" || parts[4] != "stream")
+			return false;
+
+		std::shared_ptr<Session> session = FindSession(parts[2]);
+		if (!session) {
+			WriteHttpResponse(client_fd, HttpResponse{404, json_error("unknown session")});
+			return true;
+		}
+
+		std::ostringstream headers;
+		headers << "HTTP/1.1 200 " << http_status_text(200) << "\r\n";
+		headers << "Content-Type: text/event-stream; charset=utf-8\r\n";
+		headers << "Cache-Control: no-cache\r\n";
+		headers << "Connection: keep-alive\r\n";
+		headers << "X-Accel-Buffering: no\r\n\r\n";
+		if (!write_all(client_fd, headers.str()))
+			return true;
+		if (!write_all(client_fd, "retry: 1000\n\n"))
+			return true;
+
+		std::string last_summary;
+		auto last_heartbeat = std::chrono::steady_clock::now();
+		while (true) {
+			std::string summary = SummaryJson(session);
+			if (summary != last_summary) {
+				if (!WriteSseEvent(client_fd, "summary", summary))
+					return true;
+				last_summary = std::move(summary);
+				last_heartbeat = std::chrono::steady_clock::now();
+			} else {
+				auto now = std::chrono::steady_clock::now();
+				if (now - last_heartbeat >= std::chrono::seconds(2)) {
+					if (!write_all(client_fd, ": keep-alive\n\n"))
+						return true;
+					last_heartbeat = now;
+				}
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+		}
+	}
+
+	bool WriteSseEvent(int client_fd, const std::string& event_name, const std::string& data)
+	{
+		std::ostringstream out;
+		if (!event_name.empty())
+			out << "event: " << event_name << "\n";
+		if (data.empty()) {
+			out << "data:\n\n";
+			return write_all(client_fd, out.str());
+		}
+		std::istringstream input(data);
+		std::string line;
+		while (std::getline(input, line))
+			out << "data: " << line << "\n";
+		out << "\n";
+		return write_all(client_fd, out.str());
+	}
+
+	std::string DashboardHtml(const std::shared_ptr<Session>& session) const
+	{
+		const std::string session_id = session->id;
+		const std::string session_path = SessionApiPath(session_id);
+		const std::string summary_path = SummaryPath(session_id);
+		const std::string stream_path = SummaryStreamPath(session_id);
+		std::ostringstream out;
+		out << R"__HTML__(<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SCTP Traffic Light Dashboard</title>
+  <style>
+    :root {
+      --bg: #f4efe6;
+      --panel: rgba(255, 252, 247, 0.92);
+      --panel-strong: #fffaf2;
+      --ink: #182126;
+      --muted: #59636c;
+      --border: rgba(24, 33, 38, 0.12);
+      --shadow: 0 28px 70px rgba(40, 31, 12, 0.12);
+      --green: #2b7a4b;
+      --amber: #b87912;
+      --red: #b03a2e;
+      --gray: #74818a;
+      --live: #14532d;
+      --reconnecting: #8a5a11;
+      --error: #8b1e16;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(184, 121, 18, 0.16), transparent 32%),
+        radial-gradient(circle at top right, rgba(43, 122, 75, 0.12), transparent 28%),
+        linear-gradient(180deg, #fcf7ef 0%, var(--bg) 55%, #ebe4d8 100%);
+    }
+
+    .shell {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 24px auto 40px;
+    }
+
+    .hero,
+    .panel,
+    .feature-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .hero {
+      padding: 24px;
+      border-radius: 24px;
+    }
+
+    .hero-top {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+      justify-content: space-between;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 5vw, 3.4rem);
+      line-height: 0.94;
+      letter-spacing: -0.04em;
+    }
+
+    .subtitle,
+    .note,
+    .feature-meta,
+    .feature-time,
+    .empty-state,
+    .error {
+      font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    .subtitle {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 0.94rem;
+    }
+
+    .connection {
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid currentColor;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      background: rgba(255, 255, 255, 0.75);
+    }
+
+    .connection[data-state="live"] { color: var(--live); }
+    .connection[data-state="reconnecting"] { color: var(--reconnecting); }
+    .connection[data-state="error"] { color: var(--error); }
+
+    .meta-grid,
+    .count-grid,
+    .feature-grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .meta-grid,
+    .count-grid {
+      margin-top: 18px;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    }
+
+    .panel {
+      padding: 16px 18px;
+      border-radius: 18px;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+
+    .value {
+      margin-top: 8px;
+      font-size: 1.16rem;
+      line-height: 1.3;
+      overflow-wrap: anywhere;
+    }
+
+    .count-grid {
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    }
+
+    .count {
+      position: relative;
+      overflow: hidden;
+      background: var(--panel-strong);
+    }
+
+    .count::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 6px;
+      background: var(--gray);
+    }
+
+    .count[data-tone="green"]::before { background: var(--green); }
+    .count[data-tone="amber"]::before { background: var(--amber); }
+    .count[data-tone="red"]::before { background: var(--red); }
+    .count[data-tone="gray"]::before { background: var(--gray); }
+
+    .count-number {
+      margin-top: 6px;
+      font-size: 2rem;
+      font-weight: 700;
+    }
+
+    .feature-grid {
+      margin-top: 22px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+
+    .feature-card {
+      position: relative;
+      border-radius: 20px;
+      padding: 18px 18px 16px;
+      overflow: hidden;
+      min-height: 210px;
+    }
+
+    .feature-card::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 8px;
+      background: var(--gray);
+    }
+
+    .feature-card[data-tone="green"]::before { background: var(--green); }
+    .feature-card[data-tone="amber"]::before { background: var(--amber); }
+    .feature-card[data-tone="red"]::before { background: var(--red); }
+    .feature-card[data-tone="gray"]::before { background: var(--gray); }
+
+    .feature-head {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      justify-content: space-between;
+    }
+
+    .feature-title {
+      margin: 0;
+      font-size: 1.1rem;
+      line-height: 1.2;
+    }
+
+    .state-pill {
+      flex: 0 0 auto;
+      padding: 7px 11px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      border: 1px solid currentColor;
+      background: rgba(255, 255, 255, 0.8);
+    }
+
+    .state-pill[data-tone="green"] { color: var(--green); }
+    .state-pill[data-tone="amber"] { color: var(--amber); }
+    .state-pill[data-tone="red"] { color: var(--red); }
+    .state-pill[data-tone="gray"] { color: var(--gray); }
+
+    .feature-meta {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .feature-message {
+      margin-top: 14px;
+      font-size: 0.98rem;
+      line-height: 1.45;
+    }
+
+    .feature-time {
+      margin-top: 16px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.5;
+    }
+
+    .note {
+      margin-top: 14px;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .error {
+      margin-top: 18px;
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1px solid rgba(176, 58, 46, 0.24);
+      background: rgba(176, 58, 46, 0.08);
+      color: var(--error);
+      display: none;
+    }
+
+    .empty-state {
+      margin-top: 20px;
+      padding: 20px;
+      border-radius: 18px;
+      border: 1px dashed var(--border);
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 720px) {
+      .shell { width: min(100vw - 20px, 1180px); margin-top: 10px; }
+      .hero { padding: 18px; border-radius: 20px; }
+      .feature-card { min-height: 0; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div class="hero-top">
+        <div>
+          <h1 id="title">SCTP session</h1>
+          <div class="subtitle" id="subtitle">Loading session metadata...</div>
+        </div>
+        <div class="connection" id="connection" data-state="reconnecting">loading</div>
+      </div>
+
+      <div class="meta-grid">
+        <section class="panel">
+          <div class="label">Session</div>
+          <div class="value" id="session-id">loading</div>
+        </section>
+        <section class="panel">
+          <div class="label">Agent</div>
+          <div class="value" id="agent-name">loading</div>
+        </section>
+        <section class="panel">
+          <div class="label">Environment</div>
+          <div class="value" id="environment-name">loading</div>
+        </section>
+        <section class="panel">
+          <div class="label">Active Feature</div>
+          <div class="value" id="active-feature">none</div>
+        </section>
+      </div>
+
+      <div class="count-grid" id="counts"></div>
+      <div class="note">Green means passed, amber means active, red means failed or timed out, and gray means pending or unsupported.</div>
+      <div class="error" id="error-banner"></div>
+    </section>
+
+    <section class="feature-grid" id="feature-grid"></section>
+    <div class="empty-state" id="empty-state" hidden>No features are available for this session.</div>
+  </main>
+
+  <script>
+    const sessionId = )__HTML__";
+		out << json_quote(session_id);
+		out << R"__HTML__(;
+    const sessionPath = )__HTML__";
+		out << json_quote(session_path);
+		out << R"__HTML__(;
+    const summaryPath = )__HTML__";
+		out << json_quote(summary_path);
+		out << R"__HTML__(;
+    const streamPath = )__HTML__";
+		out << json_quote(stream_path);
+		out << R"__HTML__(;
+
+    const connectionEl = document.getElementById("connection");
+    const sessionIdEl = document.getElementById("session-id");
+    const subtitleEl = document.getElementById("subtitle");
+    const agentEl = document.getElementById("agent-name");
+    const environmentEl = document.getElementById("environment-name");
+    const activeFeatureEl = document.getElementById("active-feature");
+    const countsEl = document.getElementById("counts");
+    const featureGridEl = document.getElementById("feature-grid");
+    const emptyStateEl = document.getElementById("empty-state");
+    const errorBannerEl = document.getElementById("error-banner");
+
+    let stream = null;
+    let refreshPromise = null;
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[ch]));
+    }
+
+    function formatTimestamp(value) {
+      if (!value) return "n/a";
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+    }
+
+    function toneForState(state) {
+      if (state === "passed") return "green";
+      if (state === "active") return "amber";
+      if (state === "failed" || state === "timed_out") return "red";
+      return "gray";
+    }
+
+    function setConnection(state, label) {
+      connectionEl.dataset.state = state;
+      connectionEl.textContent = label;
+    }
+
+    function showError(message) {
+      errorBannerEl.textContent = message;
+      errorBannerEl.style.display = "block";
+    }
+
+    function clearError() {
+      errorBannerEl.textContent = "";
+      errorBannerEl.style.display = "none";
+    }
+
+    async function fetchJson(path) {
+      const response = await fetch(path, { cache: "no-store" });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `${response.status} ${response.statusText}`);
+      }
+      return response.json();
+    }
+
+    function renderCounts(summary) {
+      const items = [
+        ["Passed", summary.passed, "green"],
+        ["Active", summary.active, "amber"],
+        ["Failed", summary.failed + summary.timed_out, "red"],
+        ["Pending", summary.pending, "gray"],
+        ["Unsupported", summary.unsupported, "gray"],
+      ];
+      countsEl.innerHTML = items.map(([label, value, tone]) => `
+        <section class="panel count" data-tone="${tone}">
+          <div class="label">${escapeHtml(label)}</div>
+          <div class="count-number">${escapeHtml(value)}</div>
+        </section>
+      `).join("");
+    }
+
+    function renderFeatures(summary) {
+      const features = Array.isArray(summary.features) ? summary.features : [];
+      emptyStateEl.hidden = features.length !== 0;
+      featureGridEl.innerHTML = features.map((feature) => {
+        const tone = toneForState(feature.state);
+        return `
+          <article class="feature-card" data-tone="${tone}">
+            <div class="feature-head">
+              <div>
+                <h2 class="feature-title">${escapeHtml(feature.title)}</h2>
+                <div class="feature-meta">${escapeHtml(feature.category)} / ${escapeHtml(feature.id)}</div>
+              </div>
+              <div class="state-pill" data-tone="${tone}">${escapeHtml(feature.state)}</div>
+            </div>
+            <div class="feature-message">${escapeHtml(feature.message || "no status message")}</div>
+            <div class="feature-time">
+              <div>Started: ${escapeHtml(formatTimestamp(feature.started_at))}</div>
+              <div>Finished: ${escapeHtml(formatTimestamp(feature.finished_at))}</div>
+            </div>
+          </article>
+        `;
+      }).join("");
+    }
+
+    function renderSession(session) {
+      document.getElementById("title").textContent = `SCTP session ${session.session_id}`;
+      document.title = `SCTP session ${session.session_id}`;
+      subtitleEl.textContent = `Realtime execution status for a single in-memory SCTP feature session.`;
+      sessionIdEl.textContent = session.session_id || sessionId;
+      agentEl.textContent = session.agent_name || "unlabeled";
+      environmentEl.textContent = session.environment_name || "unlabeled";
+      activeFeatureEl.textContent = session.active_feature_id || "none";
+    }
+
+    function renderSummary(summary) {
+      const features = Array.isArray(summary.features) ? summary.features : [];
+      const activeFeature = features.find((feature) => feature.state === "active");
+      renderCounts(summary);
+      renderFeatures(summary);
+      activeFeatureEl.textContent = activeFeature ? activeFeature.id : "none";
+    }
+
+    async function refreshSnapshot() {
+      const [session, summary] = await Promise.all([fetchJson(sessionPath), fetchJson(summaryPath)]);
+      renderSession(session);
+      renderSummary(summary);
+      clearError();
+    }
+
+    function scheduleRefresh() {
+      if (refreshPromise) return;
+      refreshPromise = refreshSnapshot()
+        .catch((error) => {
+          showError(`Live refresh is waiting for the server: ${error.message}`);
+        })
+        .finally(() => {
+          refreshPromise = null;
+        });
+    }
+
+    function connectStream() {
+      if (stream) stream.close();
+      stream = new EventSource(streamPath);
+      stream.onopen = () => setConnection("live", "live");
+      stream.addEventListener("summary", (event) => {
+        try {
+          renderSummary(JSON.parse(event.data));
+          clearError();
+          setConnection("live", "live");
+        } catch (error) {
+          showError(`Received an invalid live update: ${error.message}`);
+        }
+      });
+      stream.onerror = () => {
+        setConnection("reconnecting", "reconnecting");
+        scheduleRefresh();
+      };
+    }
+
+    window.addEventListener("beforeunload", () => {
+      if (stream) stream.close();
+    });
+
+    (async () => {
+      setConnection("reconnecting", "loading");
+      try {
+        await refreshSnapshot();
+        setConnection("live", "live");
+      } catch (error) {
+        showError(`Failed to load session state: ${error.message}`);
+      }
+      connectStream();
+    })();
+  </script>
+</body>
+</html>
+)__HTML__";
 		return out.str();
 	}
 
