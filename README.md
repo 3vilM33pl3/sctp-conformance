@@ -1,87 +1,132 @@
 # SCTP Conformance Suite
 
-Implementation-agnostic SCTP conformance suite for:
+The primary interface is now a FreeBSD-resident SCTP feature server.
 
-- the reference stack on `FreeBSD`
-- the local `go-sctp-linux` runtime branch
+The server runs against the FreeBSD reference implementation and exposes:
 
-The suite is intentionally runner-centric:
+- an HTTP/JSON control plane for feature discovery, session management, and result reporting
+- an SCTP data plane where the actual transport scenarios execute
 
-- a local Python 3.12 runner loads profiles and scenarios
-- adapters expose small `server` and `client` helper binaries
-- helpers emit NDJSON events
-- assertions live in the runner, not in the helpers
+The intended workflow is:
+
+1. Run `sctp-feature-server` on a FreeBSD host.
+2. Give a coding agent the server URL, the feature catalog, and a client codebase such as `go-sctp-linux` or `rust-sctp`.
+3. Let the agent build a client that attempts each feature in turn.
+4. The server marks features `passed` or `failed` from observed SCTP behavior, and the agent can declare a feature `unsupported` with evidence.
+
+The older Python runner is still present for parity work, but it is now secondary.
 
 ## Layout
 
-- `runner/`: Python package and CLI
-- `profiles/`: target definitions
-- `scenarios/`: shared scenario corpus and required feature map
-- `adapters/freebsd_c/`: FreeBSD C helper compiled on the oracle host
-- `adapters/go_net/`: Go helper built with `go-sctp-linux`
-- `artifacts/`: generated reports, logs, and captures
+- `server/freebsd_ref/`: FreeBSD C++ reference server
+- `docs/agent-http-api.md`: HTTP control plane used by coding agents
+- `scripts/smoke_feature_server.py`: acceptance smoke test for the server API and SCTP data plane
+- `adapters/freebsd_c/`: FreeBSD C helper used for smoke testing and baseline validation
+- `runner/`, `profiles/`, `scenarios/`: legacy runner-centric harness kept for migration and comparison work
 
-## Quick Start
+## FreeBSD Server
 
-List profiles:
+Build on the FreeBSD host with base tools:
 
-```bash
-python3 sctp_conformance.py list-profiles
+```sh
+cd server/freebsd_ref
+make
 ```
 
-List scenarios:
+Run the server:
 
-```bash
-python3 sctp_conformance.py list-scenarios
+```sh
+./sctp-feature-server \
+  --http-host 0.0.0.0 \
+  --http-port 18080 \
+  --sctp-addrs 10.22.6.90,127.0.0.2 \
+  --advertise-addrs 10.22.6.90,127.0.0.2
 ```
 
-Run against local `go-sctp-linux`:
+- `--sctp-addrs` are the local FreeBSD addresses the server binds.
+- `--advertise-addrs` are the addresses returned in feature contracts.
+- One active feature is allowed per session.
+- All state is in memory only.
 
-```bash
-python3 sctp_conformance.py run --profile go-sctp-linux
-```
+## Manual Prerequisites
 
-Run against the FreeBSD oracle host:
+The server never performs root actions.
 
-```bash
-python3 sctp_conformance.py run --profile freebsd-oracle
-```
+If SCTP is not loaded or a required local address is missing, the server or feature activation fails with the exact command to run manually.
 
-Results are written under `artifacts/runs/<timestamp>/`.
-
-## FreeBSD Bootstrap
-
-The FreeBSD profile is designed to work with a base FreeBSD 15.0 host. The
-runner stages and builds the helper in a scratch directory under `/tmp`.
-
-The runner does not perform any root actions.
-
-If the FreeBSD host is missing a prerequisite, the suite will stop and tell you
-which root command to run manually.
-
-The current prerequisites are:
-
-- load `sctp.ko`
-- add the configured loopback alias `127.0.0.2/8`
-
-Example setup on the FreeBSD host:
+Current prerequisites on the FreeBSD host:
 
 ```sh
 kldload /boot/kernel/sctp.ko
 ifconfig lo0 alias 127.0.0.2/8
 ```
 
-## Current v1 Coverage
+If you want remote multihoming scenarios to use non-loopback addresses, add those addresses to a real interface manually and start the server with matching `--sctp-addrs` and `--advertise-addrs`.
 
-The initial scenario set covers:
+## Agent Flow
 
-- socket create/bind/listen/connect
-- single and multi-message boundary preservation
-- stream ID and PPID round-trip
-- `SCTP_NODELAY` acceptance
-- `SCTP_INITMSG` acceptance on the listening side
-- event subscription and notification presence
-- multi-address bind/connect and address enumeration
-- negative connect-failure handling
+The control plane is documented in [docs/agent-http-api.md](/home/olivier/Projects/sctp/sctp-conformance/docs/agent-http-api.md).
 
-Advanced SCTP extensions remain future work.
+Minimal flow:
+
+```text
+GET  /v1/features
+POST /v1/sessions
+POST /v1/sessions/{sessionId}/features/{featureId}/start
+GET  /v1/sessions/{sessionId}/features/{featureId}
+POST /v1/sessions/{sessionId}/features/{featureId}/complete
+POST /v1/sessions/{sessionId}/features/{featureId}/unsupported
+GET  /v1/sessions/{sessionId}/summary
+```
+
+The current server catalog covers:
+
+- socket creation
+- basic association setup
+- single and multi-message boundaries
+- stream ID and PPID metadata
+- `SCTP_NODELAY`
+- `SCTP_INITMSG`
+- notifications
+- multihome bind/connect and address enumeration
+- negative connect error handling
+- `SCTP_DEFAULT_SNDINFO`
+- `SCTP_RECVNXTINFO`
+- `SCTP_AUTOCLOSE`
+- association status introspection
+
+## Smoke Test
+
+After building the FreeBSD helper on the FreeBSD host:
+
+```sh
+cd adapters/freebsd_c
+make
+```
+
+Run the smoke test from the local machine:
+
+```sh
+python3 scripts/smoke_feature_server.py \
+  --base-url http://free.metatao.net:18080 \
+  --ssh-host free.metatao.net \
+  --helper-path /tmp/sctp-freebsd-helper/sctp-freebsd-helper
+```
+
+The smoke test exercises:
+
+- one `server_observed` feature
+- one `hybrid` feature
+- one `agent_reported` feature
+
+## Legacy Runner
+
+The Python runner remains available:
+
+```sh
+python3 sctp_conformance.py list-profiles
+python3 sctp_conformance.py run --profile go-sctp-linux
+python3 sctp_conformance.py run --profile freebsd-oracle
+```
+
+It is retained for migration and comparison, not as the main interface for coding agents.
