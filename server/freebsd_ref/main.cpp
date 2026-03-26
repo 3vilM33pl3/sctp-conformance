@@ -491,6 +491,23 @@ set_socket_timeout(int fd, int seconds, std::string& error)
 }
 
 bool
+set_http_timeout(int fd, int seconds, std::string& error)
+{
+	struct timeval timeout_value {};
+	timeout_value.tv_sec = seconds;
+	timeout_value.tv_usec = 0;
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout_value, sizeof(timeout_value)) != 0) {
+		error = strerror_string(errno);
+		return false;
+	}
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout_value, sizeof(timeout_value)) != 0) {
+		error = strerror_string(errno);
+		return false;
+	}
+	return true;
+}
+
+bool
 apply_server_subscriptions(int fd, std::string& error)
 {
 	struct sctp_event_subscribe subscribe {};
@@ -1299,8 +1316,10 @@ public:
 				std::perror("accept");
 				break;
 			}
-			HandleClient(client_fd);
-			close(client_fd);
+			std::thread([this, client_fd]() {
+				HandleClient(client_fd);
+				close(client_fd);
+			}).detach();
 		}
 		close(listen_fd);
 		return 1;
@@ -1357,10 +1376,16 @@ private:
 
 	void HandleClient(int client_fd)
 	{
+		std::string timeout_error;
+		if (!set_http_timeout(client_fd, 5, timeout_error)) {
+			WriteHttpResponse(client_fd, HttpResponse{500, json_error(timeout_error)});
+			return;
+		}
 		HttpRequest request;
 		std::string error;
 		if (!ReadHttpRequest(client_fd, request, error)) {
-			WriteHttpResponse(client_fd, HttpResponse{400, json_error(error)});
+			const int status = error == "timed out reading HTTP request" ? 408 : 400;
+			WriteHttpResponse(client_fd, HttpResponse{status, json_error(error)});
 			return;
 		}
 		WriteHttpResponse(client_fd, HandleRequest(request));
@@ -1371,10 +1396,13 @@ private:
 		std::string raw;
 		std::array<char, 4096> buffer {};
 		size_t header_end = std::string::npos;
-		while ((header_end = raw.find("\r\n\r\n")) == std::string::npos) {
+		while ((header_end = raw.find("\r\n\r\n")) == std::string::npos &&
+		    (header_end = raw.find("\n\n")) == std::string::npos) {
 			ssize_t received = read(client_fd, buffer.data(), buffer.size());
 			if (received <= 0) {
-				error = "failed to read HTTP request";
+				error = (received < 0 && (errno == EWOULDBLOCK || errno == EAGAIN))
+				    ? "timed out reading HTTP request"
+				    : "failed to read HTTP request";
 				return false;
 			}
 			raw.append(buffer.data(), static_cast<size_t>(received));
@@ -1416,11 +1444,14 @@ private:
 		auto header_it = request.headers.find("content-length");
 		if (header_it != request.headers.end())
 			content_length = static_cast<size_t>(std::strtoul(header_it->second.c_str(), nullptr, 10));
-		request.body = raw.substr(header_end + 4);
+		const size_t body_offset = raw.compare(header_end, 4, "\r\n\r\n") == 0 ? header_end + 4 : header_end + 2;
+		request.body = raw.substr(body_offset);
 		while (request.body.size() < content_length) {
 			ssize_t received = read(client_fd, buffer.data(), buffer.size());
 			if (received <= 0) {
-				error = "failed to read HTTP body";
+				error = (received < 0 && (errno == EWOULDBLOCK || errno == EAGAIN))
+				    ? "timed out reading HTTP body"
+				    : "failed to read HTTP body";
 				return false;
 			}
 			request.body.append(buffer.data(), static_cast<size_t>(received));
