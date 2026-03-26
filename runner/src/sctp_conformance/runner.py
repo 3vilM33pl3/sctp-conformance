@@ -22,6 +22,19 @@ UNSUPPORTED_MARKERS = (
 )
 
 
+def resolve_root_password_file(profile: Profile) -> tuple[Path | None, str | None]:
+    env_name = profile.raw.get("root_password_file_env")
+    if env_name is not None:
+        env_value = os.environ.get(str(env_name))
+        if env_value:
+            return Path(env_value), str(env_name)
+        return None, str(env_name)
+    raw_value = profile.raw.get("root_password_file")
+    if raw_value is None:
+        return None, None
+    return Path(str(raw_value)), None
+
+
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -215,21 +228,39 @@ class LocalGoRunner(ProfileRunner):
 class FreeBSDRunner(ProfileRunner):
     def __init__(self, suite_root: Path, profile: Profile, run_dir: Path):
         super().__init__(suite_root, profile, run_dir)
-        password_file = Path(profile.string_value("root_password_file"))
+        password_file, password_file_env = resolve_root_password_file(profile)
         self.executor = RemoteExecutor(profile.string_value("ssh_target"), password_file=password_file)
         self.remote_workdir = profile.string_value("remote_workdir")
         self.helper_source = profile.path_value(suite_root, "helper_source")
         self.helper_binary = profile.string_value("helper_binary")
         self.loopback_aliases = profile.list_value("loopback_aliases")
         self.tcpdump_interface = profile.string_value("tcpdump_interface")
+        self.password_file_env = password_file_env
 
     def bootstrap(self) -> None:
         self.executor.run(["mkdir", "-p", self.remote_workdir])
-        load = self.executor.run_root("kldstat | grep -q ' sctp.ko' || kldload /boot/kernel/sctp.ko", timeout=20)
-        if load.returncode != 0:
-            raise RuntimeError(load.stderr or load.stdout)
+        module_state = self.executor.run(["kldstat"], timeout=20)
+        module_loaded = " sctp.ko" in module_state.stdout
+        if not module_loaded:
+            if self.executor.password_file is None:
+                detail = f" via ${self.password_file_env}" if self.password_file_env else ""
+                raise RuntimeError(
+                    f"FreeBSD SCTP module is not loaded; load sctp.ko manually or provide a root password file{detail}"
+                )
+            load = self.executor.run_root("kldload /boot/kernel/sctp.ko", timeout=20)
+            if load.returncode != 0:
+                raise RuntimeError(load.stderr or load.stdout)
+        loopback_state = self.executor.run(["ifconfig", "lo0"], timeout=20)
         for alias in self.loopback_aliases:
-            completed = self.executor.run_root(f"ifconfig lo0 alias {alias} || true", timeout=20)
+            alias_ip = alias.split("/", 1)[0]
+            if alias_ip in loopback_state.stdout:
+                continue
+            if self.executor.password_file is None:
+                detail = f" via ${self.password_file_env}" if self.password_file_env else ""
+                raise RuntimeError(
+                    f"loopback alias {alias} is missing; add it manually or provide a root password file{detail}"
+                )
+            completed = self.executor.run_root(f"ifconfig lo0 alias {alias}", timeout=20)
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr or completed.stdout)
 
@@ -262,7 +293,7 @@ class FreeBSDRunner(ProfileRunner):
         try:
             ready = server.wait_for_event("ready", timeout=10)
             connect_addrs = list(ready.get("local_addrs", []))
-            if scenario.capture_pcap and connect_addrs:
+            if scenario.capture_pcap and connect_addrs and self.executor.password_file is not None:
                 port = int(connect_addrs[0].rsplit(":", 1)[1])
                 pcap_remote = f"{self.remote_workdir}/{scenario.id}.pcap"
                 started = self.executor.run_root(

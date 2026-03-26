@@ -3,7 +3,7 @@
   "kind": "remote-freebsd-c",
   "ssh_target": "free.metatao.net",
   "remote_workdir": "/tmp/sctp-conformance",
-  "root_password_file": "/home/olivier/password.txt",
+  "root_password_file_env": "SCTP_ROOT_PASSWORD_FILE",
   "helper_source": "adapters/freebsd_c",
   "helper_binary": "sctp-freebsd-helper",
   "loopback_aliases": [
@@ -26,4 +26,3 @@
     "negative_connect_error"
   ]
 }
-

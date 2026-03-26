@@ -2,7 +2,7 @@
 
 Implementation-agnostic SCTP conformance suite for:
 
-- the FreeBSD reference stack on `free.metatao.net`
+- the reference stack on `FreeBSD`
 - the local `go-sctp-linux` runtime branch
 
 The suite is intentionally runner-centric:
@@ -44,6 +44,7 @@ python3 sctp_conformance.py run --profile go-sctp-linux
 Run against the FreeBSD oracle host:
 
 ```bash
+export SCTP_ROOT_PASSWORD_FILE=/path/to/root-password.txt
 python3 sctp_conformance.py run --profile freebsd-oracle
 ```
 
@@ -58,8 +59,17 @@ runner performs a minimal bootstrap:
 - add loopback aliases required by multihome scenarios
 - stage and build the helper in a scratch directory under `/tmp`
 
-The root password is read locally from the path configured in
-`profiles/freebsd-oracle.json`.
+The root password file path is read from `$SCTP_ROOT_PASSWORD_FILE`.
+
+Root is not required for the SCTP scenarios themselves. It is only needed when
+the runner has to:
+
+- load `sctp.ko`
+- add the configured loopback aliases
+- capture `tcpdump` pcaps
+
+If those prerequisites are already in place on the FreeBSD host, the suite can
+run without root and will simply skip pcap capture.
 
 ## Current v1 Coverage
 
