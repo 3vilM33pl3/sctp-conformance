@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-import os
 import queue
-import selectors
 import shutil
 import shlex
 import subprocess
@@ -136,9 +134,8 @@ class LocalExecutor:
 
 
 class RemoteExecutor:
-    def __init__(self, target: str, password_file: Path | None = None):
+    def __init__(self, target: str):
         self.target = target
-        self.password_file = password_file
 
     def _ssh_command(self, script: str) -> list[str]:
         return ["ssh", "-o", "BatchMode=yes", self.target, f"sh -lc {shlex.quote(script)}"]
@@ -191,70 +188,6 @@ class RemoteExecutor:
             stderr=subprocess.PIPE,
         )
         return ManagedProcess(process=process, name=name).start()
-
-    def run_root(self, shell_command: str, *, timeout: float | None = None) -> CompletedCommand:
-        if self.password_file is None:
-            raise RuntimeError("root password file is required for root operations")
-        password = self.password_file.read_text().strip().encode("utf-8") + b"\n"
-        process = subprocess.Popen(
-            [
-                "ssh",
-                "-tt",
-                "-o",
-                "BatchMode=yes",
-                self.target,
-                f"su -m root -c {shlex.quote(shell_command)}",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-        )
-        assert process.stdin is not None
-        assert process.stdout is not None
-        assert process.stderr is not None
-
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ, data="stdout")
-        selector.register(process.stderr, selectors.EVENT_READ, data="stderr")
-        stdout = bytearray()
-        stderr = bytearray()
-        prompt_window = bytearray()
-        password_sent = False
-        deadline = None if timeout is None else time.monotonic() + timeout
-
-        while selector.get_map():
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
-                process.kill()
-                process.wait(timeout=5)
-                raise subprocess.TimeoutExpired(process.args, timeout)
-            events = selector.select(remaining)
-            if not events:
-                continue
-            for key, _ in events:
-                chunk = os.read(key.fileobj.fileno(), 1024)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                if key.data == "stdout":
-                    stdout.extend(chunk)
-                else:
-                    stderr.extend(chunk)
-                prompt_window.extend(chunk)
-                if len(prompt_window) > 256:
-                    del prompt_window[:-256]
-                if not password_sent and b"assword:" in prompt_window:
-                    process.stdin.write(password)
-                    process.stdin.flush()
-                    password_sent = True
-
-        returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()) if deadline is not None else None)
-        return CompletedCommand(
-            returncode=returncode,
-            stdout=stdout.decode("utf-8", errors="replace"),
-            stderr=stderr.decode("utf-8", errors="replace"),
-        )
 
     def stage_directory(self, local_dir: Path, remote_dir: str) -> None:
         mkdir = self.run(["mkdir", "-p", remote_dir])

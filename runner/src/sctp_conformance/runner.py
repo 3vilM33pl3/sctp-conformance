@@ -22,19 +22,6 @@ UNSUPPORTED_MARKERS = (
 )
 
 
-def resolve_root_password_file(profile: Profile) -> tuple[Path | None, str | None]:
-    env_name = profile.raw.get("root_password_file_env")
-    if env_name is not None:
-        env_value = os.environ.get(str(env_name))
-        if env_value:
-            return Path(env_value), str(env_name)
-        return None, str(env_name)
-    raw_value = profile.raw.get("root_password_file")
-    if raw_value is None:
-        return None, None
-    return Path(str(raw_value)), None
-
-
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -228,41 +215,32 @@ class LocalGoRunner(ProfileRunner):
 class FreeBSDRunner(ProfileRunner):
     def __init__(self, suite_root: Path, profile: Profile, run_dir: Path):
         super().__init__(suite_root, profile, run_dir)
-        password_file, password_file_env = resolve_root_password_file(profile)
-        self.executor = RemoteExecutor(profile.string_value("ssh_target"), password_file=password_file)
+        self.executor = RemoteExecutor(profile.string_value("ssh_target"))
         self.remote_workdir = profile.string_value("remote_workdir")
         self.helper_source = profile.path_value(suite_root, "helper_source")
         self.helper_binary = profile.string_value("helper_binary")
         self.loopback_aliases = profile.list_value("loopback_aliases")
-        self.tcpdump_interface = profile.string_value("tcpdump_interface")
-        self.password_file_env = password_file_env
 
     def bootstrap(self) -> None:
         self.executor.run(["mkdir", "-p", self.remote_workdir])
         module_state = self.executor.run(["kldstat"], timeout=20)
         module_loaded = " sctp.ko" in module_state.stdout
         if not module_loaded:
-            if self.executor.password_file is None:
-                detail = f" via ${self.password_file_env}" if self.password_file_env else ""
-                raise RuntimeError(
-                    f"FreeBSD SCTP module is not loaded; load sctp.ko manually or provide a root password file{detail}"
-                )
-            load = self.executor.run_root("kldload /boot/kernel/sctp.ko", timeout=20)
-            if load.returncode != 0:
-                raise RuntimeError(load.stderr or load.stdout)
+            raise RuntimeError(
+                "FreeBSD SCTP module is not loaded on the oracle host. "
+                "Run this as root on the FreeBSD machine, then re-run the suite: "
+                "`kldload /boot/kernel/sctp.ko`"
+            )
         loopback_state = self.executor.run(["ifconfig", "lo0"], timeout=20)
         for alias in self.loopback_aliases:
             alias_ip = alias.split("/", 1)[0]
             if alias_ip in loopback_state.stdout:
                 continue
-            if self.executor.password_file is None:
-                detail = f" via ${self.password_file_env}" if self.password_file_env else ""
-                raise RuntimeError(
-                    f"loopback alias {alias} is missing; add it manually or provide a root password file{detail}"
-                )
-            completed = self.executor.run_root(f"ifconfig lo0 alias {alias}", timeout=20)
-            if completed.returncode != 0:
-                raise RuntimeError(completed.stderr or completed.stdout)
+            raise RuntimeError(
+                f"Required loopback alias {alias} is missing on the oracle host. "
+                "Run this as root on the FreeBSD machine, then re-run the suite: "
+                f"`ifconfig lo0 alias {alias}`"
+            )
 
     def build(self) -> None:
         remote_src = f"{self.remote_workdir}/freebsd_c"
@@ -286,22 +264,11 @@ class FreeBSDRunner(ProfileRunner):
     def _run_server_client(self, scenario: Scenario, scenario_dir: Path) -> ScenarioArtifacts:
         assert scenario.server is not None
         assert scenario.client is not None
-        pcap_remote = None
-        tcpdump_pid = None
         server_cmd = [self._remote_binary(), *command_flags(scenario.server, "server")]
         server = self.executor.spawn(server_cmd, name=f"{self.profile.id}:{scenario.id}:server")
         try:
             ready = server.wait_for_event("ready", timeout=10)
             connect_addrs = list(ready.get("local_addrs", []))
-            if scenario.capture_pcap and connect_addrs and self.executor.password_file is not None:
-                port = int(connect_addrs[0].rsplit(":", 1)[1])
-                pcap_remote = f"{self.remote_workdir}/{scenario.id}.pcap"
-                started = self.executor.run_root(
-                    f"sh -c 'tcpdump -U -i {self.tcpdump_interface} -w {pcap_remote} port {port} >/tmp/{scenario.id}.tcpdump.log 2>&1 & echo $!'",
-                    timeout=20,
-                )
-                if started.returncode == 0:
-                    tcpdump_pid = started.stdout.strip().splitlines()[-1] if started.stdout.strip() else None
             client_spec = scenario.client
             if client_spec.connect_from_server_ready:
                 client_spec = replace(client_spec, connect_addrs=connect_addrs)
@@ -309,13 +276,11 @@ class FreeBSDRunner(ProfileRunner):
             client = self.executor.run(client_cmd, timeout=15)
             server_result = server.wait(timeout=15)
         finally:
-            if tcpdump_pid:
-                self.executor.run_root(f"kill {tcpdump_pid} || true", timeout=20)
             server.terminate()
         stdout = "\n".join([server_result.stdout, client.stdout]).strip()
         stderr = "\n".join([server_result.stderr, client.stderr]).strip()
         events = extract_events_for_role(server_result.stdout, "server") + extract_events_for_role(client.stdout, "client")
-        artifact_paths = self._write_artifacts(scenario_dir, server_result, client, pcap_remote)
+        artifact_paths = self._write_artifacts(scenario_dir, server_result, client)
         return ScenarioArtifacts(stdout=stdout, stderr=stderr, events=events, artifact_paths=artifact_paths)
 
     def _run_client_only(self, scenario: Scenario, scenario_dir: Path) -> ScenarioArtifacts:
@@ -331,7 +296,6 @@ class FreeBSDRunner(ProfileRunner):
         scenario_dir: Path,
         server: CompletedCommand,
         client: CompletedCommand,
-        pcap_remote: str | None,
     ) -> dict[str, str]:
         (scenario_dir / "server.stdout").write_text(server.stdout)
         (scenario_dir / "server.stderr").write_text(server.stderr)
@@ -343,13 +307,6 @@ class FreeBSDRunner(ProfileRunner):
             "client_stdout": str((scenario_dir / "client.stdout").relative_to(self.run_dir)),
             "client_stderr": str((scenario_dir / "client.stderr").relative_to(self.run_dir)),
         }
-        if pcap_remote:
-            local_pcap = scenario_dir / "capture.pcap"
-            try:
-                self.executor.copy_from_remote(pcap_remote, local_pcap)
-                artifacts["pcap"] = str(local_pcap.relative_to(self.run_dir))
-            except RuntimeError:
-                pass
         return artifacts
 
     def _write_client_only_artifacts(self, scenario_dir: Path, client: CompletedCommand) -> dict[str, str]:

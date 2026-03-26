@@ -44,7 +44,6 @@ python3 sctp_conformance.py run --profile go-sctp-linux
 Run against the FreeBSD oracle host:
 
 ```bash
-export SCTP_ROOT_PASSWORD_FILE=/path/to/root-password.txt
 python3 sctp_conformance.py run --profile freebsd-oracle
 ```
 
@@ -53,23 +52,24 @@ Results are written under `artifacts/runs/<timestamp>/`.
 ## FreeBSD Bootstrap
 
 The FreeBSD profile is designed to work with a base FreeBSD 15.0 host. The
-runner performs a minimal bootstrap:
+runner stages and builds the helper in a scratch directory under `/tmp`.
 
-- load `sctp.ko` if SCTP sockets are unavailable
-- add loopback aliases required by multihome scenarios
-- stage and build the helper in a scratch directory under `/tmp`
+The runner does not perform any root actions.
 
-The root password file path is read from `$SCTP_ROOT_PASSWORD_FILE`.
+If the FreeBSD host is missing a prerequisite, the suite will stop and tell you
+which root command to run manually.
 
-Root is not required for the SCTP scenarios themselves. It is only needed when
-the runner has to:
+The current prerequisites are:
 
 - load `sctp.ko`
-- add the configured loopback aliases
-- capture `tcpdump` pcaps
+- add the configured loopback alias `127.0.0.2/8`
 
-If those prerequisites are already in place on the FreeBSD host, the suite can
-run without root and will simply skip pcap capture.
+Example setup on the FreeBSD host:
+
+```sh
+kldload /boot/kernel/sctp.ko
+ifconfig lo0 alias 127.0.0.2/8
+```
 
 ## Current v1 Coverage
 

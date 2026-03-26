@@ -3,13 +3,11 @@
   "kind": "remote-freebsd-c",
   "ssh_target": "free.metatao.net",
   "remote_workdir": "/tmp/sctp-conformance",
-  "root_password_file_env": "SCTP_ROOT_PASSWORD_FILE",
   "helper_source": "adapters/freebsd_c",
   "helper_binary": "sctp-freebsd-helper",
   "loopback_aliases": [
     "127.0.0.2/8"
   ],
-  "tcpdump_interface": "lo0",
   "capabilities": [
     "socket_create",
     "bind_listen_connect",

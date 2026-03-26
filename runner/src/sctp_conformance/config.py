@@ -44,7 +44,6 @@ class Scenario:
     server: EndpointSpec | None = None
     client: EndpointSpec | None = None
     assertions: dict[str, Any] = field(default_factory=dict)
-    capture_pcap: bool = False
 
 
 @dataclass(slots=True)
@@ -110,7 +109,6 @@ def load_scenarios(path: Path) -> ScenarioSet:
             server=_load_endpoint(item.get("server")),
             client=_load_endpoint(item.get("client")),
             assertions=dict(item.get("assertions", {})),
-            capture_pcap=bool(item.get("capture_pcap", False)),
         )
         for item in raw["scenarios"]
     ]
@@ -120,4 +118,3 @@ def load_scenarios(path: Path) -> ScenarioSet:
 def load_profile(path: Path) -> Profile:
     raw = json.loads(path.read_text())
     return Profile(id=str(raw["id"]), kind=str(raw["kind"]), raw=raw)
-

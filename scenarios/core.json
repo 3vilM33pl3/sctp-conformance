@@ -28,7 +28,6 @@
         "initmsg",
         "notifications"
       ],
-      "capture_pcap": true,
       "server": {
         "bind_addrs": ["127.0.0.1:0"],
         "subscribe": ["association", "shutdown", "dataio"],
@@ -88,7 +87,6 @@
         "local_addr_enum",
         "peer_addr_enum"
       ],
-      "capture_pcap": true,
       "server": {
         "bind_addrs": ["127.0.0.1:0", "127.0.0.2:0"],
         "subscribe": ["association", "dataio"],
@@ -118,7 +116,6 @@
       "required_features": [
         "negative_connect_error"
       ],
-      "capture_pcap": true,
       "client": {
         "connect_addrs": ["0.0.0.0:1"],
         "expect_failure": "connect_or_send",
