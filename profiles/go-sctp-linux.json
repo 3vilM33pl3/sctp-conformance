@@ -1,0 +1,24 @@
+{
+  "id": "go-sctp-linux",
+  "kind": "local-go-net",
+  "go_repo": "../go-sctp-linux",
+  "go_bin": "../go-sctp-linux/bin/go",
+  "helper_source": "adapters/go_net",
+  "helper_binary": "build/go/sctp-helper",
+  "capabilities": [
+    "socket_create",
+    "bind_listen_connect",
+    "single_message_boundary",
+    "multi_message_boundary",
+    "stream_id",
+    "ppid",
+    "nodelay",
+    "initmsg",
+    "notifications",
+    "multi_bind",
+    "local_addr_enum",
+    "peer_addr_enum",
+    "negative_connect_error"
+  ]
+}
+

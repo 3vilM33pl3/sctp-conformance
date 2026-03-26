@@ -1,0 +1,134 @@
+{
+  "required_features": [
+    "socket_create",
+    "bind_listen_connect",
+    "single_message_boundary",
+    "multi_message_boundary",
+    "stream_id",
+    "ppid",
+    "nodelay",
+    "initmsg",
+    "notifications",
+    "multi_bind",
+    "local_addr_enum",
+    "peer_addr_enum",
+    "negative_connect_error"
+  ],
+  "scenarios": [
+    {
+      "id": "loopback_basic",
+      "title": "Loopback send/receive with metadata",
+      "required_features": [
+        "socket_create",
+        "bind_listen_connect",
+        "single_message_boundary",
+        "stream_id",
+        "ppid",
+        "nodelay",
+        "initmsg",
+        "notifications"
+      ],
+      "capture_pcap": true,
+      "server": {
+        "bind_addrs": ["127.0.0.1:0"],
+        "subscribe": ["association", "shutdown", "dataio"],
+        "init_options": {
+          "num_ostreams": 8,
+          "max_instreams": 8,
+          "max_attempts": 0,
+          "max_init_timeout": 0
+        },
+        "read_messages": 1,
+        "emit_local_addrs": true
+      },
+      "client": {
+        "connect_from_server_ready": true,
+        "set_nodelay": true,
+        "messages": [
+          { "payload": "loopback-basic", "stream": 2, "ppid": 42 }
+        ]
+      },
+      "assertions": {
+        "server_recv_count": 1,
+        "server_payloads": ["loopback-basic"],
+        "server_streams": [2],
+        "server_ppids": [42],
+        "min_notify_count": 1
+      }
+    },
+    {
+      "id": "loopback_two_messages",
+      "title": "Two SCTP messages preserve boundaries",
+      "required_features": [
+        "multi_message_boundary"
+      ],
+      "server": {
+        "bind_addrs": ["127.0.0.1:0"],
+        "subscribe": ["association", "dataio"],
+        "read_messages": 2,
+        "emit_local_addrs": true
+      },
+      "client": {
+        "connect_from_server_ready": true,
+        "messages": [
+          { "payload": "alpha", "stream": 1, "ppid": 100 },
+          { "payload": "beta", "stream": 1, "ppid": 101 }
+        ]
+      },
+      "assertions": {
+        "server_recv_count": 2,
+        "server_payloads": ["alpha", "beta"]
+      }
+    },
+    {
+      "id": "multihome_bind_connect",
+      "title": "Multi-address bind/connect and enumeration",
+      "required_features": [
+        "multi_bind",
+        "local_addr_enum",
+        "peer_addr_enum"
+      ],
+      "capture_pcap": true,
+      "server": {
+        "bind_addrs": ["127.0.0.1:0", "127.0.0.2:0"],
+        "subscribe": ["association", "dataio"],
+        "read_messages": 1,
+        "emit_local_addrs": true,
+        "emit_peer_addrs": true
+      },
+      "client": {
+        "connect_from_server_ready": true,
+        "set_nodelay": true,
+        "emit_local_addrs": true,
+        "emit_peer_addrs": true,
+        "messages": [
+          { "payload": "multi-home", "stream": 6, "ppid": 606 }
+        ]
+      },
+      "assertions": {
+        "server_recv_count": 1,
+        "server_payloads": ["multi-home"],
+        "server_local_addr_count": 2,
+        "client_peer_addr_count": 2
+      }
+    },
+    {
+      "id": "unreachable_connect",
+      "title": "Connect failure is surfaced cleanly",
+      "required_features": [
+        "negative_connect_error"
+      ],
+      "capture_pcap": true,
+      "client": {
+        "connect_addrs": ["0.0.0.0:1"],
+        "expect_failure": "connect_or_send",
+        "messages": [
+          { "payload": "should-not-send", "stream": 1, "ppid": 1 }
+        ]
+      },
+      "assertions": {
+        "expected_failure": ["connect", "send"]
+      }
+    }
+  ]
+}
