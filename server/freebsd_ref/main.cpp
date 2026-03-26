@@ -1027,6 +1027,18 @@ build_feature_catalog()
 	    {"SCTP_INITMSG"},
 	    {},
 	    "Report the INITMSG values you attempted and whether the call succeeded."));
+	features.push_back(make_receive_feature(
+	    "rto_assoc_parameters",
+	    "SCTP_RTOINFO",
+	    "socket_option",
+	    "Configure association RTO parameters before or after association setup, depending on the client API surface.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Configure SCTP_RTOINFO or the environment equivalent, connect to the server, send the probe payload, then report the RTO values you applied.",
+	    {MessageSpec{"rtoinfo-check", 4, 42}},
+	    {"SCTP_RTOINFO"},
+	    {},
+	    "Report the RTO parameter values attempted and whether the API accepted them."));
 	features.push_back(make_send_feature(
 	    "notifications",
 	    "Association and shutdown notifications",
@@ -1039,6 +1051,30 @@ build_feature_catalog()
 	    {MessageSpec{"server-notify", 5, 51}},
 	    {"association", "shutdown", "dataio"},
 	    "Report the notification types observed by the client, including association and shutdown events."));
+	features.push_back(make_send_feature(
+	    "event_subscription_matrix",
+	    "Event subscription matrix",
+	    "events",
+	    "Subscribe to the SCTP event set exposed by the client environment and report which notifications are surfaced.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Subscribe to the available SCTP events, connect to the server, send the trigger payload, receive the server message, and report the exact notifications observed.",
+	    "event-matrix-ready",
+	    {MessageSpec{"server-event-matrix", 5, 52}},
+	    {"association", "shutdown", "dataio"},
+	    "Report which SCTP notifications were available and which were delivered during the scenario."));
+	features.push_back(make_send_feature(
+	    "association_shutdown_notifications",
+	    "Association shutdown notifications",
+	    "events",
+	    "Observe graceful association teardown notifications.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Subscribe to association and shutdown events, connect to the server, send the trigger payload, receive the server message, close the association cleanly, and report the shutdown-related notifications observed.",
+	    "shutdown-notify-ready",
+	    {MessageSpec{"server-shutdown-notify", 5, 53}},
+	    {"association", "shutdown"},
+	    "Report the association-change and shutdown notifications observed by the client."));
 	features.push_back(make_receive_feature(
 	    "multi_bind",
 	    "Multihome reference server",
@@ -1088,10 +1124,10 @@ build_feature_catalog()
 	    {},
 	    "0.0.0.0:1"));
 	features.push_back(make_receive_feature(
-	    "default_sndinfo",
-	    "SCTP_DEFAULT_SNDINFO",
+	    "default_sndinfo_recvrcvinfo",
+	    "SCTP_DEFAULT_SNDINFO / RECVRCVINFO",
 	    "metadata",
-	    "Set default sndinfo and send data without a per-message override.",
+	    "Set default sndinfo and confirm the server receives the expected metadata.",
 	    CompletionMode::Hybrid,
 	    20,
 	    "Set SCTP_DEFAULT_SNDINFO or the environment equivalent, then send the probe payload without overriding stream or PPID per message.",
@@ -1099,6 +1135,18 @@ build_feature_catalog()
 	    {"SCTP_DEFAULT_SNDINFO"},
 	    {},
 	    "Report whether setting the default send info succeeded."));
+	features.push_back(make_receive_feature(
+	    "unordered_delivery",
+	    "Unordered delivery",
+	    "messaging",
+	    "Send an unordered SCTP message if the client environment exposes the necessary flag or sndinfo field.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Send the probe payload as an unordered SCTP message if supported, then report whether the environment exposed and accepted unordered delivery controls.",
+	    {MessageSpec{"unordered-check", 12, 1201}},
+	    {},
+	    {},
+	    "Report whether unordered delivery controls were available and whether the send path accepted them."));
 	features.push_back(make_send_feature(
 	    "recvnxtinfo",
 	    "SCTP_RECVNXTINFO",
@@ -1121,6 +1169,66 @@ build_feature_catalog()
 	    "Report the AUTOCLOSE value attempted and the outcome.",
 	    {"SCTP_AUTOCLOSE"}));
 	features.push_back(make_receive_feature(
+	    "bindx_add_remove",
+	    "SCTP_BINDX add/remove",
+	    "multihoming",
+	    "Add and remove local SCTP bind addresses on the client before connecting.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "If the environment exposes SCTP_BINDX or equivalent multihome bind controls, add and remove local addresses as needed, connect to the server, send the probe payload, then report the bindx operations attempted.",
+	    {MessageSpec{"bindx-check", 13, 1301}},
+	    {},
+	    {},
+	    "Report the local addresses added or removed and whether the API accepted the operations."));
+	features.push_back(make_receive_feature(
+	    "primary_addr_management",
+	    "Primary address management",
+	    "multihoming",
+	    "Attempt to set a local primary address for the association.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Connect to the server, attempt to set the local primary address if the API supports it, send the probe payload, and report the result.",
+	    {MessageSpec{"primary-addr-check", 14, 1401}},
+	    {},
+	    {},
+	    "Report whether the client environment exposed local primary-address management and the result of the call."));
+	features.push_back(make_receive_feature(
+	    "peer_primary_addr_request",
+	    "Peer primary address request",
+	    "multihoming",
+	    "Attempt to request a peer primary address change for the association.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Connect to the server, attempt to request a peer primary address change if the API supports it, send the probe payload, and report the result.",
+	    {MessageSpec{"peer-primary-check", 14, 1402}},
+	    {},
+	    {},
+	    "Report whether the client environment exposed peer primary-address requests and the result of the call."));
+	features.push_back(make_receive_feature(
+	    "peeloff_assoc",
+	    "Association peeloff",
+	    "association",
+	    "Peel the association onto a dedicated socket if the client environment supports peeloff.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Connect to the server, peel off the association to a dedicated socket if supported, send the probe payload on the peeled-off path, and report the result.",
+	    {MessageSpec{"peeloff-check", 15, 1501}},
+	    {},
+	    {},
+	    "Report whether the association peeloff API was available and whether it succeeded."));
+	features.push_back(make_receive_feature(
+	    "assoc_id_listing",
+	    "Association identifier listing",
+	    "association",
+	    "Enumerate association identifiers after connecting.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Connect to the server, send the probe payload, enumerate association identifiers if the API supports it, and report the results.",
+	    {MessageSpec{"assoc-id-list", 15, 1502}},
+	    {},
+	    {},
+	    "Report the association identifiers returned by the client environment, or explain why enumeration is unavailable."));
+	features.push_back(make_receive_feature(
 	    "assoc_status_opt_info",
 	    "SCTP_STATUS / opt_info",
 	    "introspection",
@@ -1132,6 +1240,30 @@ build_feature_catalog()
 	    {},
 	    {},
 	    "Report whether association status information was available and summarize the returned state."));
+	features.push_back(make_send_feature(
+	    "stream_reconfig_reset",
+	    "Stream reconfiguration reset",
+	    "reconfiguration",
+	    "Attempt an SCTP stream reset against the active association.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Connect to the server, send the trigger payload, attempt stream reset or the environment equivalent, and report the outcome.",
+	    "stream-reset-ready",
+	    {MessageSpec{"stream-reset-ack", 16, 1601}},
+	    {},
+	    "Report which stream reset operation was attempted and whether the client environment accepted it."));
+	features.push_back(make_send_feature(
+	    "stream_reconfig_add_streams",
+	    "Stream reconfiguration add streams",
+	    "reconfiguration",
+	    "Attempt to add outbound or inbound streams on the active association.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Connect to the server, send the trigger payload, attempt to add streams through the environment's SCTP reconfiguration API, and report the outcome.",
+	    "stream-add-ready",
+	    {MessageSpec{"stream-add-ack", 16, 1602}},
+	    {},
+	    "Report the requested stream changes and whether the client environment accepted them."));
 	return features;
 }
 

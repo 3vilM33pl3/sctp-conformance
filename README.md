@@ -87,13 +87,20 @@ The current server catalog covers:
 - stream ID and PPID metadata
 - `SCTP_NODELAY`
 - `SCTP_INITMSG`
+- `SCTP_RTOINFO`
 - notifications
+- event subscription coverage and shutdown notifications
 - multihome bind/connect and address enumeration
+- `SCTP_BINDX` add/remove
+- primary-address management requests
 - negative connect error handling
-- `SCTP_DEFAULT_SNDINFO`
+- `SCTP_DEFAULT_SNDINFO` and server-side receive metadata checks
 - `SCTP_RECVNXTINFO`
+- unordered delivery attempts
 - `SCTP_AUTOCLOSE`
+- association peeloff and association ID enumeration
 - association status introspection
+- stream reconfiguration reset and add-stream attempts
 
 ## Smoke Test
 
