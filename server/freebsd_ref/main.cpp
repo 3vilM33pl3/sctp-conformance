@@ -329,6 +329,35 @@ json_error(const std::string& message)
 	return std::string("{\"error\":") + json_quote(message) + "}";
 }
 
+[[nodiscard]] std::string
+html_escape(const std::string& value)
+{
+	std::ostringstream out;
+	for (char ch : value) {
+		switch (ch) {
+		case '&':
+			out << "&amp;";
+			break;
+		case '<':
+			out << "&lt;";
+			break;
+		case '>':
+			out << "&gt;";
+			break;
+		case '"':
+			out << "&quot;";
+			break;
+		case '\'':
+			out << "&#39;";
+			break;
+		default:
+			out << ch;
+			break;
+		}
+	}
+	return out.str();
+}
+
 bool
 write_all(int fd, const std::string& data)
 {
@@ -1350,7 +1379,7 @@ private:
 	std::vector<FeatureDefinition> feature_catalog_;
 	std::unordered_map<std::string, const FeatureDefinition*> feature_index_;
 	std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
-	std::mutex sessions_mutex_;
+	mutable std::mutex sessions_mutex_;
 
 	bool CheckSctpAvailable(std::string& error)
 	{
@@ -1499,6 +1528,8 @@ private:
 	HttpResponse HandleRequest(const HttpRequest& request)
 	{
 		std::vector<std::string> parts = split_path(request.path);
+		if (request.method == "GET" && request.path == "/")
+			return {200, SessionIndexHtml(), "text/html; charset=utf-8"};
 		if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "dashboard" && request.method == "GET") {
 			std::shared_ptr<Session> session = FindSession(parts[1]);
 			if (!session)
@@ -1810,6 +1841,382 @@ private:
 			out << "data: " << line << "\n";
 		out << "\n";
 		return write_all(client_fd, out.str());
+	}
+
+	std::string SessionIndexHtml() const
+	{
+		struct SessionCard {
+			std::string id;
+			std::string agent_name;
+			std::string environment_name;
+			std::string created_at;
+			std::string active_feature_id;
+			std::string dashboard_path;
+			Clock::time_point created_at_point {};
+		};
+
+		std::vector<SessionCard> active_sessions;
+		std::vector<SessionCard> other_sessions;
+		{
+			std::lock_guard<std::mutex> lock(sessions_mutex_);
+			for (const auto& item : sessions_) {
+				const std::shared_ptr<Session>& session = item.second;
+				SessionCard card;
+				{
+					std::lock_guard<std::mutex> session_lock(session->mutex);
+					card.id = session->id;
+					card.agent_name = session->agent_name;
+					card.environment_name = session->environment_name;
+					card.created_at = iso_time(session->created_at);
+					card.created_at_point = session->created_at;
+					card.active_feature_id = session->active_feature_id;
+					card.dashboard_path = DashboardPath(session->id);
+				}
+				if (!card.active_feature_id.empty())
+					active_sessions.push_back(std::move(card));
+				else
+					other_sessions.push_back(std::move(card));
+			}
+		}
+
+		auto newest_first = [](const SessionCard& a, const SessionCard& b) {
+			return a.created_at_point > b.created_at_point;
+		};
+		std::sort(active_sessions.begin(), active_sessions.end(), newest_first);
+		std::sort(other_sessions.begin(), other_sessions.end(), newest_first);
+
+		auto render_cards = [&](const std::vector<SessionCard>& cards, const std::string& empty_text) {
+			std::ostringstream section;
+			if (cards.empty()) {
+				section << "<div class=\"empty-state\">" << html_escape(empty_text) << "</div>";
+				return section.str();
+			}
+			section << "<div class=\"session-grid\">";
+			for (const SessionCard& card : cards) {
+				const bool active = !card.active_feature_id.empty();
+				section << "<article class=\"session-card\" data-state=\"" << (active ? "active" : "idle") << "\">"
+				        << "<div class=\"session-card-top\">"
+				        << "<div>"
+				        << "<h2 class=\"session-title\">" << html_escape(card.id) << "</h2>"
+				        << "<div class=\"session-meta\">"
+				        << "<span>" << html_escape(card.agent_name.empty() ? "unknown-agent" : card.agent_name) << "</span>"
+				        << "<span>" << html_escape(card.environment_name.empty() ? "unknown-environment" : card.environment_name) << "</span>"
+				        << "</div>"
+				        << "</div>"
+				        << "<div class=\"session-pill\" data-state=\"" << (active ? "active" : "idle") << "\">"
+				        << (active ? "active" : "idle")
+				        << "</div>"
+				        << "</div>"
+				        << "<div class=\"session-body\">"
+				        << "<div class=\"row\"><span class=\"label\">Created</span><span class=\"value\">"
+				        << html_escape(card.created_at.empty() ? "unknown" : card.created_at)
+				        << "</span></div>"
+				        << "<div class=\"row\"><span class=\"label\">Feature</span><span class=\"value\">"
+				        << html_escape(active ? card.active_feature_id : "none")
+				        << "</span></div>"
+				        << "</div>"
+				        << "<a class=\"session-link\" href=\"" << html_escape(card.dashboard_path) << "\">Open dashboard</a>"
+				        << "</article>";
+			}
+			section << "</div>";
+			return section.str();
+		};
+
+		std::ostringstream out;
+		out << R"__HTML__(<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="3">
+  <title>SCTP Session Index</title>
+  <style>
+    :root {
+      --bg: #f4efe6;
+      --panel: rgba(255, 252, 247, 0.92);
+      --panel-strong: #fffaf2;
+      --ink: #182126;
+      --muted: #59636c;
+      --border: rgba(24, 33, 38, 0.12);
+      --shadow: 0 28px 70px rgba(40, 31, 12, 0.12);
+      --green: #2b7a4b;
+      --amber: #b87912;
+      --gray: #74818a;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(184, 121, 18, 0.16), transparent 32%),
+        radial-gradient(circle at top right, rgba(43, 122, 75, 0.12), transparent 28%),
+        linear-gradient(180deg, #fcf7ef 0%, var(--bg) 55%, #ebe4d8 100%);
+    }
+
+    .shell {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 24px auto 40px;
+    }
+
+    .hero,
+    .section,
+    .session-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .hero,
+    .section {
+      padding: 24px;
+      border-radius: 24px;
+    }
+
+    .section {
+      margin-top: 18px;
+    }
+
+    h1,
+    h2,
+    .subtitle,
+    .session-meta,
+    .session-body,
+    .refresh-note,
+    .empty-state {
+      margin: 0;
+    }
+
+    h1 {
+      font-size: clamp(2rem, 4.8vw, 3.2rem);
+      line-height: 0.96;
+      letter-spacing: -0.04em;
+    }
+
+    .subtitle,
+    .refresh-note,
+    .session-meta,
+    .session-body,
+    .empty-state {
+      font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    .subtitle,
+    .refresh-note {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .subtitle {
+      margin-top: 10px;
+    }
+
+    .refresh-note {
+      margin-top: 16px;
+    }
+
+    .hero-stats {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      margin-top: 20px;
+    }
+
+    .stat {
+      padding: 16px 18px;
+      border-radius: 18px;
+      background: var(--panel-strong);
+      border: 1px solid var(--border);
+    }
+
+    .stat .label {
+      color: var(--muted);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+
+    .stat .value {
+      margin-top: 8px;
+      font-size: 2rem;
+      line-height: 1;
+    }
+
+    .section-title {
+      font-size: 1.3rem;
+      line-height: 1.1;
+    }
+
+    .section-copy {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .session-grid {
+      margin-top: 18px;
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+
+    .session-card {
+      border-radius: 20px;
+      padding: 18px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .session-card::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 8px;
+      background: var(--gray);
+    }
+
+    .session-card[data-state="active"]::before {
+      background: var(--amber);
+    }
+
+    .session-card-top {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      justify-content: space-between;
+    }
+
+    .session-title {
+      font-size: 1.12rem;
+      line-height: 1.18;
+      overflow-wrap: anywhere;
+    }
+
+    .session-meta {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .session-pill {
+      flex: 0 0 auto;
+      padding: 7px 11px;
+      border-radius: 999px;
+      border: 1px solid currentColor;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      background: rgba(255, 255, 255, 0.8);
+      color: var(--gray);
+    }
+
+    .session-pill[data-state="active"] {
+      color: var(--amber);
+    }
+
+    .session-body {
+      margin-top: 16px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.55;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      justify-content: space-between;
+      align-items: baseline;
+    }
+
+    .row + .row {
+      margin-top: 8px;
+    }
+
+    .row .label {
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .row .value {
+      color: var(--ink);
+      text-align: right;
+      overflow-wrap: anywhere;
+    }
+
+    .session-link {
+      display: inline-block;
+      margin-top: 18px;
+      color: var(--ink);
+      text-decoration: none;
+      border-bottom: 1px solid rgba(24, 33, 38, 0.24);
+      padding-bottom: 2px;
+    }
+
+    .empty-state {
+      margin-top: 18px;
+      padding: 20px;
+      border-radius: 18px;
+      border: 1px dashed var(--border);
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 720px) {
+      .shell { width: min(100vw - 20px, 1180px); margin-top: 10px; }
+      .hero, .section { padding: 18px; border-radius: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <h1>SCTP session index</h1>
+      <p class="subtitle">Live dashboard links for the FreeBSD reference server. This page refreshes every 3 seconds.</p>
+      <div class="hero-stats">
+        <section class="stat">
+          <div class="label">Active Sessions</div>
+          <div class="value">)__HTML__"
+		    << active_sessions.size()
+		    << R"__HTML__(</div>
+        </section>
+        <section class="stat">
+          <div class="label">Known Sessions</div>
+          <div class="value">)__HTML__"
+		    << (active_sessions.size() + other_sessions.size())
+		    << R"__HTML__(</div>
+        </section>
+      </div>
+      <p class="refresh-note">Open a dashboard link to watch a single session update in realtime.</p>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Active Sessions</h2>
+      <p class="section-copy">Sessions with an in-flight feature are listed here first.</p>
+      )__HTML__"
+		    << render_cards(active_sessions, "No sessions are active right now.")
+		    << R"__HTML__(
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Other Sessions</h2>
+      <p class="section-copy">Idle or completed sessions stay available until the server restarts.</p>
+      )__HTML__"
+		    << render_cards(other_sessions, "No additional sessions are currently stored in memory.")
+		    << R"__HTML__(
+    </section>
+  </main>
+</body>
+</html>)__HTML__";
+		return out.str();
 	}
 
 	std::string DashboardHtml(const std::shared_ptr<Session>& session) const
