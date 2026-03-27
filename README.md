@@ -11,7 +11,7 @@ The server runs against the FreeBSD reference implementation and exposes:
 The intended workflow is:
 
 1. Run `sctp-feature-server` on a FreeBSD host.
-2. Give a coding agent the server URL, the feature catalog, and a client codebase such as `go-sctp-linux` or `rust-sctp`.
+2. Give a coding agent the server URL, the feature catalog, and a client codebase such as `go-sctp` or `rust-sctp`.
 3. Let the agent build a client that attempts each feature in turn.
 4. The server marks features `passed` or `failed` from observed SCTP behavior, and the agent can declare a feature `unsupported` with evidence.
 
@@ -141,7 +141,7 @@ The Python runner remains available:
 
 ```sh
 python3 sctp_conformance.py list-profiles
-python3 sctp_conformance.py run --profile go-sctp-linux
+python3 sctp_conformance.py run --profile go-sctp
 python3 sctp_conformance.py run --profile freebsd-oracle
 ```
 

@@ -50,7 +50,7 @@ Optional flat JSON body:
 ```json
 {
   "agent_name": "codex-cli",
-  "environment_name": "go-sctp-linux"
+  "environment_name": "go-sctp"
 }
 ```
 

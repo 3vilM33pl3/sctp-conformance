@@ -1,8 +1,8 @@
 {
-  "id": "go-sctp-linux",
+  "id": "go-sctp",
   "kind": "local-go-net",
-  "go_repo": "../go-sctp-linux",
-  "go_bin": "../go-sctp-linux/bin/go",
+  "go_repo": "../go-sctp",
+  "go_bin": "../go-sctp/bin/go",
   "helper_source": "adapters/go_net",
   "helper_binary": "build/go/sctp-helper",
   "capabilities": [
