@@ -1,8 +1,22 @@
 # SCTP Conformance Suite
 
-The primary interface is now a FreeBSD-resident SCTP feature server.
+`sctp-conformance` is a FreeBSD reference-backed SCTP conformance project.
+It exposes a browser dashboard plus an HTTP/JSON control plane so coding
+agents can build SCTP clients in real language runtimes and have their
+behavior scored against the reference implementation.
 
-The server runs against the FreeBSD reference implementation and exposes:
+## Dashboard
+
+The single-session dashboard is the main operator view while an agent is
+attempting scenarios.
+
+![Session dashboard](docs/images/dashboard-demo.png)
+
+## How It Works
+
+The primary interface is a FreeBSD-resident SCTP feature server.
+
+The server exposes:
 
 - an HTTP/JSON control plane for feature discovery, session management, and result reporting
 - a built-in browser dashboard for live per-session traffic-light status
@@ -11,19 +25,53 @@ The server runs against the FreeBSD reference implementation and exposes:
 The intended workflow is:
 
 1. Run `sctp-feature-server` on a FreeBSD host.
-2. Give a coding agent the server URL, the feature catalog, and a client codebase such as `go-sctp` or `rust-sctp`.
+2. Give a coding agent the server URL, the feature catalog, and one of the client repositories in `clients/`.
 3. Let the agent build a client that attempts each feature in turn.
 4. The server marks features `passed` or `failed` from observed SCTP behavior, and the agent can declare a feature `unsupported` with evidence.
 
 The older Python runner is still present for parity work, but it is now secondary.
 
-## Layout
+## LLM-Built Clients
 
-- `server/freebsd_ref/`: FreeBSD C++ reference server
-- `docs/agent-http-api.md`: HTTP control plane used by coding agents
-- `scripts/smoke_feature_server.py`: acceptance smoke test for the server API and SCTP data plane
-- `adapters/freebsd_c/`: FreeBSD C helper used for smoke testing and baseline validation
-- `runner/`, `profiles/`, `scenarios/`: legacy runner-centric harness kept for migration and comparison work
+This repository is designed for LLM-assisted client development.
+
+- `clients/go-sctp` is the Go runtime fork used for Go client work.
+- `clients/rust-sctp` is the Rust runtime fork used for Rust client work.
+- An agent such as Codex CLI is pointed at one of those submodules plus the feature-server URL.
+- The agent edits and builds the client in the submodule checkout, then drives scenarios against the FreeBSD server.
+- When a feature cannot be implemented in the current runtime API, the agent reports it as `unsupported` with concrete evidence instead of guessing.
+
+The current published Go client is in `clients/go-sctp/misc/sctp-feature-client/go`.
+
+## Clone And Bootstrap
+
+Clone with submodules:
+
+```sh
+git clone --recurse-submodules git@github.com:3vilM33pl3/sctp-conformance.git
+cd sctp-conformance
+```
+
+If you cloned without submodules:
+
+```sh
+git submodule update --init --recursive
+```
+
+Bootstrap the Go toolchain inside the Go client submodule before trying the Go feature client:
+
+```sh
+cd clients/go-sctp/src
+./make.bash
+cd ../../..
+```
+
+After that, the Go feature client can be built from the submodule root:
+
+```sh
+cd clients/go-sctp
+GOROOT=$(pwd) ./bin/go build ./misc/sctp-feature-client/go
+```
 
 ## FreeBSD Server
 
@@ -109,6 +157,17 @@ The current server catalog covers:
 - association peeloff and association ID enumeration
 - association status introspection
 - stream reconfiguration reset and add-stream attempts
+
+## Layout
+
+- `server/freebsd_ref/`: FreeBSD C++ reference server
+- `clients/go-sctp/`: Go runtime fork used for Go client generation
+- `clients/rust-sctp/`: Rust runtime fork used for Rust client generation
+- `docs/agent-http-api.md`: HTTP control plane used by coding agents
+- `docs/images/dashboard-demo.png`: README dashboard screenshot
+- `scripts/smoke_feature_server.py`: acceptance smoke test for the server API and SCTP data plane
+- `adapters/freebsd_c/`: FreeBSD C helper used for smoke testing and baseline validation
+- `runner/`, `profiles/`, `scenarios/`: legacy runner-centric harness kept for migration and comparison work
 
 ## Smoke Test
 

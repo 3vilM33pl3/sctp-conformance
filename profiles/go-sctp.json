@@ -1,8 +1,8 @@
 {
   "id": "go-sctp",
   "kind": "local-go-net",
-  "go_repo": "../go-sctp",
-  "go_bin": "../go-sctp/bin/go",
+  "go_repo": "clients/go-sctp",
+  "go_bin": "clients/go-sctp/bin/go",
   "helper_source": "adapters/go_net",
   "helper_binary": "build/go/sctp-helper",
   "capabilities": [
@@ -21,4 +21,3 @@
     "negative_connect_error"
   ]
 }
-

@@ -1,0 +1,8 @@
+[submodule "clients/go-sctp"]
+	path = clients/go-sctp
+	url = git@github.com:3vilM33pl3/go-sctp.git
+	branch = sctp/linux-v1
+[submodule "clients/rust-sctp"]
+	path = clients/rust-sctp
+	url = git@github.com:3vilM33pl3/rust-sctp.git
+	branch = main
