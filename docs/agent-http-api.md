@@ -5,21 +5,33 @@ The FreeBSD reference server exposes a small HTTP/JSON control plane plus a buil
 Health check:
 
 - `GET /healthz`
+- `GET /` serves the live session index page with links to every in-memory session dashboard
 
 ## Session Flow
 
-1. `GET /v1/features`
-2. `POST /v1/sessions`
-3. Optional: open the returned `dashboard_path` in a browser
-4. `POST /v1/sessions/{sessionId}/features/{featureId}/start`
-5. Execute the SCTP scenario in the client environment
-6. Poll `GET /v1/sessions/{sessionId}/features/{featureId}` or watch `GET /v1/sessions/{sessionId}/summary/stream`
-7. If required by the feature's `completion_mode`, call:
+1. `GET /` to browse active and historical session dashboards
+2. `GET /v1/features`
+3. `POST /v1/sessions`
+4. Optional: open the returned `dashboard_path` in a browser
+5. `POST /v1/sessions/{sessionId}/features/{featureId}/start`
+6. Execute the SCTP scenario in the client environment
+7. Poll `GET /v1/sessions/{sessionId}/features/{featureId}` or watch `GET /v1/sessions/{sessionId}/summary/stream`
+8. If required by the feature's `completion_mode`, call:
    - `POST /v1/sessions/{sessionId}/features/{featureId}/complete`
    - or `POST /v1/sessions/{sessionId}/features/{featureId}/unsupported`
-8. Fetch `GET /v1/sessions/{sessionId}/summary`
+9. Fetch `GET /v1/sessions/{sessionId}/summary`
 
 ## Endpoints
+
+### `GET /`
+
+Serves the built-in session index page.
+
+The page auto-refreshes and shows:
+
+- active sessions first
+- idle or completed sessions below
+- direct links to `GET /sessions/{sessionId}/dashboard`
 
 ### `GET /v1/features`
 
