@@ -205,3 +205,12 @@ python3 sctp_conformance.py run --profile freebsd-oracle
 ```
 
 It is retained for migration and comparison, not as the main interface for coding agents.
+
+## Licensing
+
+`sctp-conformance` itself is licensed under the BSD 2-Clause License. See [LICENSE](/home/olivier/Projects/sctp/sctp-conformance/LICENSE).
+
+That top-level license does not replace or override the licenses of the client submodules under `clients/`. Those are separate repositories with their own license terms:
+
+- `clients/go-sctp`: see `clients/go-sctp/LICENSE`
+- `clients/rust-sctp`: see `clients/rust-sctp/LICENSE-APACHE`, `clients/rust-sctp/LICENSE-MIT`, and the `clients/rust-sctp/LICENSES/` directory
