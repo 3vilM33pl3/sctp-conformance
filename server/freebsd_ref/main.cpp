@@ -377,6 +377,36 @@ write_all(int fd, const std::string& data)
 }
 
 bool
+append_utf8_codepoint(uint32_t codepoint, std::ostringstream& buffer)
+{
+	if (codepoint <= 0x7F) {
+		buffer << static_cast<char>(codepoint);
+		return true;
+	}
+	if (codepoint <= 0x7FF) {
+		buffer << static_cast<char>(0xC0 | ((codepoint >> 6) & 0x1F));
+		buffer << static_cast<char>(0x80 | (codepoint & 0x3F));
+		return true;
+	}
+	if (codepoint >= 0xD800 && codepoint <= 0xDFFF)
+		return false;
+	if (codepoint <= 0xFFFF) {
+		buffer << static_cast<char>(0xE0 | ((codepoint >> 12) & 0x0F));
+		buffer << static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+		buffer << static_cast<char>(0x80 | (codepoint & 0x3F));
+		return true;
+	}
+	if (codepoint <= 0x10FFFF) {
+		buffer << static_cast<char>(0xF0 | ((codepoint >> 18) & 0x07));
+		buffer << static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F));
+		buffer << static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+		buffer << static_cast<char>(0x80 | (codepoint & 0x3F));
+		return true;
+	}
+	return false;
+}
+
+bool
 parse_simple_json_object(const std::string& input, std::map<std::string, std::string>& out, std::string& error)
 {
 	size_t i = 0;
@@ -424,6 +454,32 @@ parse_simple_json_object(const std::string& input, std::map<std::string, std::st
 				case 't':
 					buffer << '\t';
 					break;
+				case 'u': {
+					if (i + 4 > input.size()) {
+						error = "invalid JSON unicode escape";
+						return false;
+					}
+					uint32_t codepoint = 0;
+					for (size_t hex = 0; hex < 4; ++hex) {
+						char digit = input[i++];
+						codepoint <<= 4;
+						if (digit >= '0' && digit <= '9')
+							codepoint |= static_cast<uint32_t>(digit - '0');
+						else if (digit >= 'a' && digit <= 'f')
+							codepoint |= static_cast<uint32_t>(digit - 'a' + 10);
+						else if (digit >= 'A' && digit <= 'F')
+							codepoint |= static_cast<uint32_t>(digit - 'A' + 10);
+						else {
+							error = "invalid JSON unicode escape";
+							return false;
+						}
+					}
+					if (!append_utf8_codepoint(codepoint, buffer)) {
+						error = "unsupported JSON unicode escape";
+						return false;
+					}
+					break;
+				}
 				default:
 					error = "unsupported JSON escape";
 					return false;
@@ -575,6 +631,19 @@ apply_server_subscriptions(int fd, std::string& error)
 	return true;
 }
 
+bool
+apply_server_initmsg(int fd, std::string& error)
+{
+	struct sctp_initmsg initmsg {};
+	initmsg.sinit_num_ostreams = 32;
+	initmsg.sinit_max_instreams = 32;
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_INITMSG, &initmsg, sizeof(initmsg)) != 0) {
+		error = strerror_string(errno);
+		return false;
+	}
+	return true;
+}
+
 [[nodiscard]] std::vector<std::string>
 with_port(const std::vector<std::string>& addrs, uint16_t port)
 {
@@ -617,7 +686,7 @@ create_listening_socket(const ServerOptions& options, size_t bind_count, int tim
 	}
 	int on = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-	if (!apply_server_subscriptions(fd, error) || !set_socket_timeout(fd, timeout_seconds, error)) {
+	if (!apply_server_initmsg(fd, error) || !apply_server_subscriptions(fd, error) || !set_socket_timeout(fd, timeout_seconds, error)) {
 		close(fd);
 		return std::nullopt;
 	}
