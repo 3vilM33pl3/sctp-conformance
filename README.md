@@ -166,6 +166,8 @@ The current server catalog covers:
 - `SCTP_NODELAY`
 - `SCTP_INITMSG`
 - `SCTP_RTOINFO`
+- `SCTP_DELAYED_SACK`
+- `SCTP_MAX_BURST`
 - notifications
 - event subscription coverage and shutdown notifications
 - multihome bind/connect and address enumeration
@@ -173,6 +175,7 @@ The current server catalog covers:
 - primary-address management requests
 - negative connect error handling
 - `SCTP_DEFAULT_SNDINFO` and server-side receive metadata checks
+- large-message reassembly and `SCTP_MAXSEG` fragmentation checks
 - `SCTP_RECVNXTINFO`
 - unordered delivery attempts
 - `SCTP_AUTOCLOSE`

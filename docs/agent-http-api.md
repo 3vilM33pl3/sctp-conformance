@@ -88,6 +88,7 @@ Starts one feature in the session and returns a scenario contract containing:
 - required subscriptions
 - required messages to send
 - optional messages the server will send
+- optional per-feature tuning objects such as `socket_tuning`
 - timeout and completion mode
 - reporting instructions
 

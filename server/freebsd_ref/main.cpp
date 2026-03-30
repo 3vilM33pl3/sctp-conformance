@@ -85,6 +85,13 @@ struct SchedulerContract {
 	int message_count = 12;
 };
 
+struct SocketTuningContract {
+	uint32_t delayed_sack_delay_ms = 0;
+	uint32_t delayed_sack_freq = 0;
+	uint32_t max_burst = 0;
+	uint32_t maxseg = 0;
+};
+
 enum class CompletionMode {
 	ServerObserved,
 	AgentReported,
@@ -136,6 +143,7 @@ struct FeatureDefinition {
 	std::optional<AddressReconfigContract> address_reconfig;
 	std::optional<InterleavingContract> interleaving;
 	std::optional<SchedulerContract> scheduler;
+	std::optional<SocketTuningContract> socket_tuning;
 	bool manual_setup_required = false;
 	std::vector<std::string> manual_setup_instructions;
 };
@@ -510,6 +518,28 @@ json_scheduler_contract(const SchedulerContract& config)
 	    << "\"secondary_value\":" << config.secondary_value << ","
 	    << "\"message_count\":" << config.message_count
 	    << "}";
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_socket_tuning_contract(const SocketTuningContract& config)
+{
+	std::ostringstream out;
+	out << "{";
+	bool first = true;
+	auto append = [&](const char* key, uint32_t value) {
+		if (value == 0)
+			return;
+		if (!first)
+			out << ",";
+		first = false;
+		out << json_quote(key) << ":" << value;
+	};
+	append("delayed_sack_delay_ms", config.delayed_sack_delay_ms);
+	append("delayed_sack_freq", config.delayed_sack_freq);
+	append("max_burst", config.max_burst);
+	append("maxseg", config.maxseg);
+	out << "}";
 	return out.str();
 }
 
@@ -1469,6 +1499,10 @@ rfc_references_for_feature(const std::string& feature_id)
 		return {make_rfc_reference("6458", "8.1.3", "Initialization Parameters (SCTP_INITMSG)")};
 	if (feature_id == "rto_assoc_parameters")
 		return {make_rfc_reference("6458", "8.1.1", "Retransmission Timeout Parameters (SCTP_RTOINFO)")};
+	if (feature_id == "delayed_sack_tuning")
+		return {make_rfc_reference("6458", "8.1.19", "Get or Set Delayed SACK Timer (SCTP_DELAYED_SACK)")};
+	if (feature_id == "max_burst_tuning")
+		return {make_rfc_reference("6458", "8.1.24", "Set or Get the Maximum Burst (SCTP_MAX_BURST)")};
 	if (feature_id == "notifications" || feature_id == "event_subscription_matrix")
 		return {
 		    make_rfc_reference("6458", "6.2.2", "SCTP_EVENT Option"),
@@ -1495,6 +1529,10 @@ rfc_references_for_feature(const std::string& feature_id)
 		    make_rfc_reference("6458", "8.1.29", "SCTP_RECVRCVINFO"),
 		    make_rfc_reference("6458", "8.1.31", "SCTP_DEFAULT_SNDINFO"),
 		};
+	if (feature_id == "large_message_reassembly")
+		return {make_rfc_reference("9260", "6.9", "Fragmentation and Reassembly")};
+	if (feature_id == "maxseg_fragmentation")
+		return {make_rfc_reference("6458", "8.1.16", "Get or Set the Maximum Fragmentation Size (SCTP_MAXSEG)")};
 	if (feature_id == "recvnxtinfo")
 		return {make_rfc_reference("6458", "8.1.30", "SCTP_RECVNXTINFO")};
 	if (feature_id == "autoclose")
@@ -1657,6 +1695,34 @@ build_feature_catalog()
 	    {"SCTP_RTOINFO"},
 	    {},
 	    "Report the RTO parameter values attempted and whether the API accepted them."));
+	FeatureDefinition delayed_sack = make_receive_feature(
+	    "delayed_sack_tuning",
+	    "SCTP_DELAYED_SACK",
+	    "socket_option",
+	    "Configure delayed SACK behavior on the active association before sending the probe payload.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Apply SCTP_DELAYED_SACK or the environment equivalent, connect to the server, send the probe payload, then report the delayed-SACK values attempted.",
+	    {MessageSpec{"delayed-sack-check", 4, 43}},
+	    {"SCTP_DELAYED_SACK"},
+	    {},
+	    "Report the delayed-SACK timer and frequency attempted and whether the API accepted them.");
+	delayed_sack.socket_tuning = SocketTuningContract{200, 2, 0, 0};
+	features.push_back(std::move(delayed_sack));
+	FeatureDefinition max_burst = make_receive_feature(
+	    "max_burst_tuning",
+	    "SCTP_MAX_BURST",
+	    "socket_option",
+	    "Configure maximum burst on the active association before sending the probe payload.",
+	    CompletionMode::Hybrid,
+	    20,
+	    "Apply SCTP_MAX_BURST or the environment equivalent, connect to the server, send the probe payload, then report the value attempted.",
+	    {MessageSpec{"max-burst-check", 4, 44}},
+	    {"SCTP_MAX_BURST"},
+	    {},
+	    "Report the maximum-burst value attempted and whether the API accepted it.");
+	max_burst.socket_tuning = SocketTuningContract{0, 0, 2, 0};
+	features.push_back(std::move(max_burst));
 	features.push_back(make_send_feature(
 	    "notifications",
 	    "Association and shutdown notifications",
@@ -1753,6 +1819,29 @@ build_feature_catalog()
 	    {"SCTP_DEFAULT_SNDINFO"},
 	    {},
 	    "Report whether setting the default send info succeeded."));
+	features.push_back(make_receive_feature(
+	    "large_message_reassembly",
+	    "Large message reassembly",
+	    "fragmentation",
+	    "Send one large SCTP user message and verify the server receives a reassembled message with the original boundary preserved.",
+	    CompletionMode::ServerObserved,
+	    25,
+	    "Connect to the server and send one large SCTP message with the specified payload and metadata.",
+	    {MessageSpec{"large-reassembly", 24, 2401, 131072}}));
+	FeatureDefinition maxseg = make_receive_feature(
+	    "maxseg_fragmentation",
+	    "SCTP_MAXSEG fragmentation",
+	    "fragmentation",
+	    "Limit the outbound SCTP fragment size and verify the server still receives one intact reassembled user message.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Apply SCTP_MAXSEG or the environment equivalent, connect to the server, send the large probe payload, then report the fragmentation limit attempted.",
+	    {MessageSpec{"maxseg-fragmentation", 24, 2402, 65536}},
+	    {"SCTP_MAXSEG"},
+	    {},
+	    "Report the SCTP_MAXSEG value attempted and whether the API accepted it.");
+	maxseg.socket_tuning = SocketTuningContract{0, 0, 0, 1200};
+	features.push_back(std::move(maxseg));
 	features.push_back(make_receive_feature(
 	    "unordered_delivery",
 	    "Unordered delivery",
@@ -3598,6 +3687,8 @@ private:
 			out << ",\"interleaving\":" << json_interleaving_contract(*feature.interleaving);
 		if (feature.scheduler)
 			out << ",\"scheduler\":" << json_scheduler_contract(*feature.scheduler);
+		if (feature.socket_tuning)
+			out << ",\"socket_tuning\":" << json_socket_tuning_contract(*feature.socket_tuning);
 		out << "}";
 		return out.str();
 	}
