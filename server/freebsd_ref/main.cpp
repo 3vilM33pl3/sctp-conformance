@@ -2653,15 +2653,17 @@ private:
 
     .feature-grid {
       margin-top: 22px;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
     }
 
     .feature-card {
       position: relative;
+      display: flex;
+      flex-direction: column;
       border-radius: 20px;
       padding: 18px 18px 16px;
       overflow: hidden;
-      min-height: 210px;
+      min-height: 0;
     }
 
     .feature-card::before {
@@ -2712,17 +2714,19 @@ private:
       font-size: 0.78rem;
       text-transform: uppercase;
       letter-spacing: 0.08em;
+      line-height: 1.5;
     }
 
     .feature-message {
       margin-top: 14px;
       font-size: 0.98rem;
       line-height: 1.45;
+      max-width: 60ch;
     }
 
     .feature-mapping {
       margin-top: 14px;
-      padding: 12px 13px;
+      padding: 14px;
       border-radius: 14px;
       border: 1px solid var(--border);
       background: rgba(255, 255, 255, 0.56);
@@ -2730,10 +2734,11 @@ private:
 
     .mapping-row {
       display: grid;
-      grid-template-columns: 110px 1fr;
-      gap: 8px;
+      grid-template-columns: 116px minmax(0, 1fr);
+      gap: 10px;
       font-size: 0.8rem;
       line-height: 1.45;
+      align-items: start;
     }
 
     .mapping-row + .mapping-row {
@@ -2750,13 +2755,18 @@ private:
     .mapping-value {
       overflow-wrap: anywhere;
       font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+      min-width: 0;
     }
 
     .feature-time {
-      margin-top: 16px;
+      margin-top: auto;
+      padding-top: 16px;
+      border-top: 1px solid rgba(24, 33, 38, 0.08);
       color: var(--muted);
       font-size: 0.78rem;
       line-height: 1.5;
+      display: grid;
+      gap: 4px;
     }
 
     .note {
@@ -2784,10 +2794,15 @@ private:
       text-align: center;
     }
 
+    @media (max-width: 900px) {
+      .feature-grid { grid-template-columns: 1fr; }
+      .mapping-row { grid-template-columns: 1fr; gap: 3px; }
+    }
+
     @media (max-width: 720px) {
       .shell { width: min(100vw - 20px, 1180px); margin-top: 10px; }
       .hero { padding: 18px; border-radius: 20px; }
-      .feature-card { min-height: 0; }
+      .feature-card { padding: 16px 16px 14px; }
     }
   </style>
 </head>
