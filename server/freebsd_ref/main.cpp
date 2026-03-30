@@ -38,11 +38,51 @@ namespace {
 using Clock = std::chrono::system_clock;
 
 constexpr int kBacklog = 16;
-constexpr size_t kBufferSize = 8192;
+constexpr size_t kBufferSize = 262144;
+constexpr uint8_t kSctpChunkAsconf = 0xc1;
+constexpr uint8_t kSctpChunkAsconfAck = 0x80;
+
 struct MessageSpec {
 	std::string payload;
 	uint16_t stream = 0;
 	uint32_t ppid = 0;
+	size_t size_bytes = 0;
+	bool unordered = false;
+	std::string pr_policy;
+	uint32_t pr_value = 0;
+	uint16_t auth_key_id = 0;
+};
+
+struct AuthContract {
+	std::vector<uint8_t> chunk_types;
+	uint16_t primary_key_id = 1;
+	std::string primary_secret;
+	uint16_t secondary_key_id = 2;
+	std::string secondary_secret;
+};
+
+struct AddressReconfigContract {
+	std::vector<std::string> add_addresses;
+	std::vector<std::string> remove_addresses;
+};
+
+struct InterleavingContract {
+	int fragment_interleave_level = 2;
+	size_t large_message_size = 65536;
+	uint16_t large_stream = 18;
+	uint32_t large_ppid = 1801;
+	uint16_t small_stream = 19;
+	uint32_t small_ppid = 1802;
+	int small_message_count = 2;
+};
+
+struct SchedulerContract {
+	std::string policy;
+	uint16_t primary_stream = 20;
+	uint16_t secondary_stream = 21;
+	uint16_t primary_value = 32;
+	uint16_t secondary_value = 8;
+	int message_count = 12;
 };
 
 enum class CompletionMode {
@@ -55,6 +95,7 @@ enum class ScenarioKind {
 	AgentOnly,
 	ReceiveMessages,
 	SendAfterTrigger,
+	ReceivePRMessages,
 };
 
 enum class FeatureState {
@@ -84,6 +125,12 @@ struct FeatureDefinition {
 	std::string trigger_payload;
 	std::string negative_connect_target;
 	size_t expected_peer_addr_count = 0;
+	std::optional<AuthContract> auth;
+	std::optional<AddressReconfigContract> address_reconfig;
+	std::optional<InterleavingContract> interleaving;
+	std::optional<SchedulerContract> scheduler;
+	bool manual_setup_required = false;
+	std::vector<std::string> manual_setup_instructions;
 };
 
 struct FeatureExecution {
@@ -306,6 +353,45 @@ json_array_strings(const std::vector<std::string>& values)
 }
 
 [[nodiscard]] std::string
+json_array_uint8(const std::vector<uint8_t>& values)
+{
+	std::ostringstream out;
+	out << "[";
+	for (size_t i = 0; i < values.size(); i++) {
+		if (i != 0)
+			out << ",";
+		out << static_cast<unsigned int>(values[i]);
+	}
+	out << "]";
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_bool(bool value)
+{
+	return value ? "true" : "false";
+}
+
+[[nodiscard]] std::string
+materialize_payload(const MessageSpec& message)
+{
+	if (message.size_bytes == 0 || message.size_bytes <= message.payload.size())
+		return message.payload;
+	if (message.payload.empty())
+		return std::string(message.size_bytes, 'x');
+	std::string out;
+	out.reserve(message.size_bytes);
+	while (out.size() < message.size_bytes) {
+		const size_t remaining = message.size_bytes - out.size();
+		if (remaining >= message.payload.size())
+			out += message.payload;
+		else
+			out.append(message.payload.data(), remaining);
+	}
+	return out;
+}
+
+[[nodiscard]] std::string
 json_messages(const std::vector<MessageSpec>& values)
 {
 	std::ostringstream out;
@@ -316,10 +402,77 @@ json_messages(const std::vector<MessageSpec>& values)
 		out << "{"
 		    << "\"payload\":" << json_quote(values[i].payload) << ","
 		    << "\"stream\":" << values[i].stream << ","
-		    << "\"ppid\":" << values[i].ppid
+		    << "\"ppid\":" << values[i].ppid;
+		if (values[i].size_bytes != 0)
+			out << ",\"size_bytes\":" << values[i].size_bytes;
+		if (values[i].unordered)
+			out << ",\"unordered\":true";
+		if (!values[i].pr_policy.empty())
+			out << ",\"pr_policy\":" << json_quote(values[i].pr_policy);
+		if (values[i].pr_value != 0)
+			out << ",\"pr_value\":" << values[i].pr_value;
+		if (values[i].auth_key_id != 0)
+			out << ",\"auth_key_id\":" << values[i].auth_key_id;
+		out
 		    << "}";
 	}
 	out << "]";
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_auth_contract(const AuthContract& auth)
+{
+	std::ostringstream out;
+	out << "{"
+	    << "\"chunk_types\":" << json_array_uint8(auth.chunk_types) << ","
+	    << "\"primary_key_id\":" << auth.primary_key_id << ","
+	    << "\"primary_secret\":" << json_quote(auth.primary_secret) << ","
+	    << "\"secondary_key_id\":" << auth.secondary_key_id << ","
+	    << "\"secondary_secret\":" << json_quote(auth.secondary_secret)
+	    << "}";
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_address_reconfig_contract(const AddressReconfigContract& config)
+{
+	std::ostringstream out;
+	out << "{"
+	    << "\"add_addresses\":" << json_array_strings(config.add_addresses) << ","
+	    << "\"remove_addresses\":" << json_array_strings(config.remove_addresses)
+	    << "}";
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_interleaving_contract(const InterleavingContract& config)
+{
+	std::ostringstream out;
+	out << "{"
+	    << "\"fragment_interleave_level\":" << config.fragment_interleave_level << ","
+	    << "\"large_message_size\":" << config.large_message_size << ","
+	    << "\"large_stream\":" << config.large_stream << ","
+	    << "\"large_ppid\":" << config.large_ppid << ","
+	    << "\"small_stream\":" << config.small_stream << ","
+	    << "\"small_ppid\":" << config.small_ppid << ","
+	    << "\"small_message_count\":" << config.small_message_count
+	    << "}";
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_scheduler_contract(const SchedulerContract& config)
+{
+	std::ostringstream out;
+	out << "{"
+	    << "\"policy\":" << json_quote(config.policy) << ","
+	    << "\"primary_stream\":" << config.primary_stream << ","
+	    << "\"secondary_stream\":" << config.secondary_stream << ","
+	    << "\"primary_value\":" << config.primary_value << ","
+	    << "\"secondary_value\":" << config.secondary_value << ","
+	    << "\"message_count\":" << config.message_count
+	    << "}";
 	return out.str();
 }
 
@@ -997,9 +1150,9 @@ run_receive_worker(
 			}
 			if ((flags & MSG_NOTIFICATION) != 0)
 				continue;
-			buffer[received] = '\0';
+			const std::string received_payload(buffer, static_cast<size_t>(received));
 			const MessageSpec& expected = expected_messages[matched];
-			if (expected.payload != buffer) {
+			if (materialize_payload(expected) != received_payload) {
 				mark_failed(session, execution, "unexpected payload for feature " + execution->definition->id);
 				return;
 			}
@@ -1022,6 +1175,75 @@ run_receive_worker(
 			}
 		}
 		mark_network_complete(session, execution);
+	}).detach();
+}
+
+void
+run_pr_receive_worker(
+    const std::shared_ptr<Session>& session,
+    const std::shared_ptr<FeatureExecution>& execution,
+    int fd,
+    std::vector<MessageSpec> expected_messages)
+{
+	std::thread([session, execution, fd, expected_messages = std::move(expected_messages)]() {
+		if (expected_messages.size() < 2) {
+			mark_failed(session, execution, "PR-SCTP feature is missing expected messages");
+			return;
+		}
+		char buffer[kBufferSize + 1] = {0};
+		struct iovec iov {};
+		iov.iov_base = buffer;
+		iov.iov_len = kBufferSize;
+		const std::string skipped_payload = materialize_payload(expected_messages[0]);
+		const std::string final_payload = materialize_payload(expected_messages.back());
+		bool saw_skipped = false;
+		bool saw_final = false;
+		while (true) {
+			struct sockaddr_storage from {};
+			struct sctp_rcvinfo rcvinfo {};
+			socklen_t fromlen = sizeof(from);
+			socklen_t infolen = sizeof(rcvinfo);
+			unsigned int infotype = SCTP_RECVV_RCVINFO;
+			int flags = 0;
+			const int received = static_cast<int>(sctp_recvv(
+			    fd,
+			    &iov,
+			    1,
+			    reinterpret_cast<struct sockaddr*>(&from),
+			    &fromlen,
+			    &rcvinfo,
+			    &infolen,
+			    &infotype,
+			    &flags));
+			if (received < 0) {
+				const int recv_errno = errno;
+				if ((recv_errno == EWOULDBLOCK || recv_errno == EAGAIN) && saw_final) {
+					if (saw_skipped) {
+						mark_failed(session, execution, "partially reliable SCTP message was delivered; apply the documented impairment before retrying");
+					} else {
+						mark_network_complete(session, execution);
+					}
+				} else {
+					mark_failed(session, execution, recv_errno == EWOULDBLOCK || recv_errno == EAGAIN
+					    ? "timed out waiting for partially reliable SCTP traffic"
+					    : strerror_string(recv_errno));
+				}
+				return;
+			}
+			if ((flags & MSG_NOTIFICATION) != 0)
+				continue;
+			const std::string received_payload(buffer, static_cast<size_t>(received));
+			if (received_payload == skipped_payload) {
+				saw_skipped = true;
+				continue;
+			}
+			if (received_payload == final_payload) {
+				saw_final = true;
+				continue;
+			}
+			mark_failed(session, execution, "unexpected SCTP payload for PR-SCTP scenario");
+			return;
+		}
 	}).detach();
 }
 
@@ -1072,12 +1294,15 @@ run_send_after_trigger_worker(
 			break;
 		}
 		for (const MessageSpec& message : server_messages) {
+			std::string payload = materialize_payload(message);
 			struct sctp_sndinfo sndinfo {};
 			struct iovec send_iov {};
-			send_iov.iov_base = const_cast<char*>(message.payload.data());
-			send_iov.iov_len = message.payload.size();
+			send_iov.iov_base = const_cast<char*>(payload.data());
+			send_iov.iov_len = payload.size();
 			sndinfo.snd_sid = message.stream;
 			sndinfo.snd_ppid = message.ppid;
+			if (message.unordered)
+				sndinfo.snd_flags |= SCTP_UNORDERED;
 			sndinfo.snd_assoc_id = rcvinfo.rcv_assoc_id;
 			if (sctp_sendv(fd,
 			        &send_iov,
@@ -1506,6 +1731,146 @@ build_feature_catalog()
 	    {MessageSpec{"stream-add-ack", 16, 1602}},
 	    {},
 	    "Report the requested stream changes and whether the client environment accepted them."));
+
+	FeatureDefinition pr_ttl = make_receive_feature(
+	    "pr_sctp_ttl",
+	    "PR-SCTP TTL policy",
+	    "reliability",
+	    "Apply time-based partial reliability and verify forward progress under operator-provided impairment.",
+	    CompletionMode::Hybrid,
+	    30,
+	    "Apply the documented traffic impairment on the Linux client host, configure a TTL-based partially reliable send, then send the reliable follow-up message.",
+	    {MessageSpec{"pr-ttl-drop", 17, 1701, 32768, false, "ttl", 250, 0}, MessageSpec{"pr-ttl-delivered", 17, 1702}},
+	    {"SCTP_DEFAULT_PRINFO"},
+	    {},
+	    "Report the TTL policy applied and confirm the manual impairment was active.");
+	pr_ttl.scenario_kind = ScenarioKind::ReceivePRMessages;
+	pr_ttl.manual_setup_required = true;
+	pr_ttl.manual_setup_instructions = {
+		"On the Linux client host, apply temporary impairment before running this feature, for example:",
+		"sudo tc qdisc replace dev <iface> root netem loss 30% delay 200ms 40ms",
+		"After the test run, remove it with: sudo tc qdisc del dev <iface> root"};
+	features.push_back(std::move(pr_ttl));
+
+	FeatureDefinition pr_rtx = make_receive_feature(
+	    "pr_sctp_rtx",
+	    "PR-SCTP retransmission policy",
+	    "reliability",
+	    "Apply retransmission-limited partial reliability and verify forward progress under operator-provided impairment.",
+	    CompletionMode::Hybrid,
+	    30,
+	    "Apply the documented traffic impairment on the Linux client host, configure a retransmission-limited partially reliable send, then send the reliable follow-up message.",
+	    {MessageSpec{"pr-rtx-drop", 17, 1703, 32768, false, "rtx", 1, 0}, MessageSpec{"pr-rtx-delivered", 17, 1704}},
+	    {"SCTP_DEFAULT_PRINFO"},
+	    {},
+	    "Report the retransmission policy applied and confirm the manual impairment was active.");
+	pr_rtx.scenario_kind = ScenarioKind::ReceivePRMessages;
+	pr_rtx.manual_setup_required = true;
+	pr_rtx.manual_setup_instructions = pr_ttl.manual_setup_instructions;
+	features.push_back(std::move(pr_rtx));
+
+	FeatureDefinition auth_required = make_receive_feature(
+	    "auth_required_chunks",
+	    "SCTP AUTH required chunks",
+	    "authentication",
+	    "Configure authenticated chunk coverage before sending the probe payload.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Configure SCTP AUTH chunk coverage and shared keys, connect to the server, send the probe payload, then report the AUTH setup attempted.",
+	    {MessageSpec{"auth-required-check", 22, 2201}},
+	    {"SCTP_AUTH_CHUNK", "SCTP_AUTH_KEY"},
+	    {},
+	    "Report the AUTH chunk types and key ids configured on the client.");
+	auth_required.auth = AuthContract{{kSctpChunkAsconf, kSctpChunkAsconfAck}, 7, "auth-required-primary", 8, "auth-required-secondary"};
+	auth_required.manual_setup_required = true;
+	auth_required.manual_setup_instructions = {
+		"On the Linux client host, enable SCTP AUTH before running this feature:",
+		"sudo sysctl -w net.sctp.auth_enable=1"};
+	features.push_back(std::move(auth_required));
+
+	FeatureDefinition auth_rotate = make_receive_feature(
+	    "auth_key_rotation",
+	    "SCTP AUTH key rotation",
+	    "authentication",
+	    "Rotate SCTP AUTH keys before sending the probe payload.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Install two SCTP AUTH keys, activate the secondary key, connect to the server, send the probe payload, then report the key-rotation sequence attempted.",
+	    {MessageSpec{"auth-key-rotation", 22, 2202, 0, false, "", 0, 8}},
+	    {"SCTP_AUTH_KEY", "SCTP_AUTH_ACTIVE_KEY"},
+	    {},
+	    "Report the SCTP AUTH key ids installed and which key was activated for the send path.");
+	auth_rotate.auth = AuthContract{{kSctpChunkAsconf, kSctpChunkAsconfAck}, 7, "auth-rotation-primary", 8, "auth-rotation-secondary"};
+	auth_rotate.manual_setup_required = true;
+	auth_rotate.manual_setup_instructions = auth_required.manual_setup_instructions;
+	features.push_back(std::move(auth_rotate));
+
+	FeatureDefinition asconf = make_receive_feature(
+	    "asconf_add_remove",
+	    "ASCONF address add/remove",
+	    "multihoming",
+	    "Attempt dynamic address reconfiguration on the client association.",
+	    CompletionMode::Hybrid,
+	    30,
+	    "If the client environment exposes dynamic address reconfiguration, add and remove the provided local SCTP addresses, send the probe payload, then report the operations attempted.",
+	    {MessageSpec{"asconf-check", 23, 2301}},
+	    {"SCTP_BINDX", "SCTP_SET_PEER_PRIMARY_ADDR"},
+	    {},
+	    "Report which addresses were added and removed through the client's address-reconfiguration API.",
+	    2,
+	    0);
+	asconf.address_reconfig = AddressReconfigContract{{"127.0.0.2:0"}, {"127.0.0.2:0"}};
+	asconf.manual_setup_required = true;
+	asconf.manual_setup_instructions = {
+		"On the Linux client host, enable SCTP dynamic address reconfiguration before running this feature:",
+		"sudo sysctl -w net.sctp.addip_enable=1",
+		"Ensure the add/remove addresses exist locally, or adjust the contract to use host-local addresses."};
+	features.push_back(std::move(asconf));
+
+	FeatureDefinition interleave = make_send_feature(
+	    "idata_interleaving",
+	    "I-DATA / fragment interleaving",
+	    "messaging",
+	    "Enable fragment interleaving and observe server traffic that mixes one large message with smaller messages.",
+	    CompletionMode::Hybrid,
+	    30,
+	    "Enable fragment interleaving, connect to the server, send the trigger payload, receive the server messages, and report whether smaller messages made progress while the large message was in flight.",
+	    "idata-interleave-ready",
+	    {MessageSpec{"idata-large", 18, 1801, 65536}, MessageSpec{"idata-small-a", 19, 1802}, MessageSpec{"idata-small-b", 19, 1803}},
+	    {},
+	    "Report the fragment-interleave level applied and the receive ordering observed for the server messages.");
+	interleave.interleaving = InterleavingContract{2, 65536, 18, 1801, 19, 1802, 2};
+	features.push_back(std::move(interleave));
+
+	FeatureDefinition scheduler_policy = make_send_feature(
+	    "stream_scheduler_policy",
+	    "Stream scheduler policy",
+	    "scheduler",
+	    "Select a non-default SCTP stream scheduler policy on the active association.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Connect to the server, send the trigger payload, apply the requested stream scheduler policy, receive the acknowledgement, and report the scheduler configuration attempted.",
+	    "scheduler-policy-ready",
+	    {MessageSpec{"scheduler-policy-ack", 20, 2001}},
+	    {},
+	    "Report the SCTP stream scheduler policy applied and whether the call succeeded.");
+	scheduler_policy.scheduler = SchedulerContract{"priority", 20, 21, 32, 8, 12};
+	features.push_back(std::move(scheduler_policy));
+
+	FeatureDefinition scheduler_value = make_send_feature(
+	    "stream_scheduler_value",
+	    "Stream scheduler value",
+	    "scheduler",
+	    "Apply per-stream scheduler values on the active association.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Connect to the server, send the trigger payload, apply the requested per-stream scheduler values, receive the acknowledgement, and report the values attempted.",
+	    "scheduler-value-ready",
+	    {MessageSpec{"scheduler-value-ack", 21, 2101}},
+	    {},
+	    "Report the per-stream scheduler values attempted and whether the calls succeeded.");
+	scheduler_value.scheduler = SchedulerContract{"priority", 20, 21, 64, 4, 12};
+	features.push_back(std::move(scheduler_value));
 	return features;
 }
 
@@ -2931,7 +3296,8 @@ private:
 				session->active_feature_id = execution->definition->id;
 			}
 			contract = build_contract(*execution->definition, {});
-		} else if (execution->definition->scenario_kind == ScenarioKind::ReceiveMessages) {
+		} else if (execution->definition->scenario_kind == ScenarioKind::ReceiveMessages ||
+		    execution->definition->scenario_kind == ScenarioKind::ReceivePRMessages) {
 			auto socket_info = create_listening_socket(options_, execution->definition->bind_address_count, execution->definition->timeout_seconds, error);
 			if (!socket_info)
 				return {409, json_error(error)};
@@ -2942,7 +3308,11 @@ private:
 				session->active_feature_id = execution->definition->id;
 			}
 			contract = build_contract(*execution->definition, socket_info->advertise_addrs);
-			run_receive_worker(session, execution, socket_info->fd, execution->definition->client_send_messages, execution->definition->expected_peer_addr_count);
+			if (execution->definition->scenario_kind == ScenarioKind::ReceivePRMessages) {
+				run_pr_receive_worker(session, execution, socket_info->fd, execution->definition->client_send_messages);
+			} else {
+				run_receive_worker(session, execution, socket_info->fd, execution->definition->client_send_messages, execution->definition->expected_peer_addr_count);
+			}
 		} else {
 			auto socket_info = create_listening_socket(options_, execution->definition->bind_address_count, execution->definition->timeout_seconds, error);
 			if (!socket_info)
@@ -2996,9 +3366,19 @@ private:
 		    << "\"trigger_payload\":" << json_quote(feature.trigger_payload) << ","
 		    << "\"negative_connect_target\":" << json_quote(feature.negative_connect_target) << ","
 		    << "\"timeout_seconds\":" << feature.timeout_seconds << ","
+		    << "\"manual_setup_required\":" << json_bool(feature.manual_setup_required) << ","
+		    << "\"manual_setup_instructions\":" << json_array_strings(feature.manual_setup_instructions) << ","
 		    << "\"report_prompt\":" << json_quote(feature.report_prompt) << ","
-		    << "\"instructions_text\":" << json_quote(feature.instructions_text)
-		    << "}";
+		    << "\"instructions_text\":" << json_quote(feature.instructions_text);
+		if (feature.auth)
+			out << ",\"auth\":" << json_auth_contract(*feature.auth);
+		if (feature.address_reconfig)
+			out << ",\"address_reconfig\":" << json_address_reconfig_contract(*feature.address_reconfig);
+		if (feature.interleaving)
+			out << ",\"interleaving\":" << json_interleaving_contract(*feature.interleaving);
+		if (feature.scheduler)
+			out << ",\"scheduler\":" << json_scheduler_contract(*feature.scheduler);
+		out << "}";
 		return out.str();
 	}
 
