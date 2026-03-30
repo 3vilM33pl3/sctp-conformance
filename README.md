@@ -29,8 +29,6 @@ The intended workflow is:
 3. Let the agent build a client that attempts each feature in turn.
 4. The server marks features `passed` or `failed` from observed SCTP behavior, and the agent can declare a feature `unsupported` with evidence.
 
-The older Python runner is still present for parity work, but it is now secondary.
-
 ## LLM-Built Clients
 
 This repository is designed for LLM-assisted client development.
@@ -188,7 +186,6 @@ The current server catalog covers:
 - `docs/images/dashboard-demo.png`: README dashboard screenshot
 - `scripts/smoke_feature_server.py`: acceptance smoke test for the server API and SCTP data plane
 - `adapters/freebsd_c/`: FreeBSD C helper used for smoke testing and baseline validation
-- `runner/`, `profiles/`, `scenarios/`: legacy runner-centric harness kept for migration and comparison work
 
 ## Smoke Test
 
@@ -214,18 +211,6 @@ The smoke test exercises:
 - one `hybrid` feature
 - one `agent_reported` feature
 - dashboard discovery and the live summary stream
-
-## Legacy Runner
-
-The Python runner remains available:
-
-```sh
-python3 sctp_conformance.py list-profiles
-python3 sctp_conformance.py run --profile go-sctp
-python3 sctp_conformance.py run --profile freebsd-oracle
-```
-
-It is retained for migration and comparison, not as the main interface for coding agents.
 
 ## Licensing
 
