@@ -87,6 +87,18 @@ Starts one feature in the session and returns a scenario contract containing:
 - timeout and completion mode
 - reporting instructions
 
+The intended client flow for one feature is:
+
+1. call `start`
+2. read the returned `contract`
+3. execute the SCTP actions described by that contract
+4. poll feature state or watch the summary stream
+5. call `complete` or `unsupported` only if the feature's `completion_mode` requires agent-side reporting
+
+The contract is server-owned. Clients should treat fields such as `connect_addresses`,
+`client_socket_options`, `client_subscriptions`, `client_send_messages`, and
+`server_send_messages` as the authoritative per-feature instructions.
+
 ### `GET /v1/sessions/{sessionId}/features/{featureId}`
 
 Returns the per-feature state:

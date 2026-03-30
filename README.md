@@ -135,6 +135,23 @@ GET  /v1/sessions/{sessionId}/summary
 
 `POST /v1/sessions` returns a `dashboard_path` for the live session board. The dashboard uses the summary snapshot and the summary SSE stream to show pending, active, passed, failed, timed-out, and unsupported feature states in realtime.
 
+## Contract Lifecycle
+
+Each feature run is driven by a server-issued scenario contract.
+
+1. The client reads the catalog from `GET /v1/features`.
+2. The client creates a session with `POST /v1/sessions`.
+3. For one feature, the client calls `POST /v1/sessions/{sessionId}/features/{featureId}/start`.
+4. The `start` response includes the per-feature `contract`.
+5. The client uses that contract to decide:
+   - which SCTP address or addresses to dial
+   - which socket options or subscriptions to enable
+   - which messages to send in `client_send_messages`
+   - whether it should expect server-sent messages
+6. The server scores the SCTP behavior it observes, and the client submits `complete` or `unsupported` only when the feature's `completion_mode` requires it.
+
+The important boundary is that the FreeBSD server owns the contract contents. Client implementations consume the contract; they do not invent feature-specific payloads or addresses locally.
+
 The current server catalog covers:
 
 - socket creation
