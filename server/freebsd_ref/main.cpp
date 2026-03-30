@@ -92,6 +92,12 @@ struct SocketTuningContract {
 	uint32_t maxseg = 0;
 };
 
+struct OneToManyContract {
+	size_t expected_associations = 0;
+	bool same_socket_required = false;
+	bool require_distinct_assoc_ids = false;
+};
+
 enum class CompletionMode {
 	ServerObserved,
 	AgentReported,
@@ -101,6 +107,7 @@ enum class CompletionMode {
 enum class ScenarioKind {
 	AgentOnly,
 	ReceiveMessages,
+	ReceiveMessagesMultiTarget,
 	SendAfterTrigger,
 	ReceivePRMessages,
 };
@@ -144,6 +151,7 @@ struct FeatureDefinition {
 	std::optional<InterleavingContract> interleaving;
 	std::optional<SchedulerContract> scheduler;
 	std::optional<SocketTuningContract> socket_tuning;
+	std::optional<OneToManyContract> one_to_many;
 	bool manual_setup_required = false;
 	std::vector<std::string> manual_setup_instructions;
 };
@@ -163,7 +171,8 @@ struct FeatureExecution {
 	std::string contract_json;
 	bool network_complete = false;
 	bool agent_complete = false;
-	int active_fd = -1;
+	std::vector<int> active_fds;
+	std::vector<std::string> assoc_ids;
 	Clock::time_point started_at {};
 	Clock::time_point deadline_at {};
 	Clock::time_point finished_at {};
@@ -540,6 +549,18 @@ json_socket_tuning_contract(const SocketTuningContract& config)
 	append("max_burst", config.max_burst);
 	append("maxseg", config.maxseg);
 	out << "}";
+	return out.str();
+}
+
+[[nodiscard]] std::string
+json_one_to_many_contract(const OneToManyContract& config)
+{
+	std::ostringstream out;
+	out << "{"
+	    << "\"expected_associations\":" << config.expected_associations << ","
+	    << "\"same_socket_required\":" << json_bool(config.same_socket_required) << ","
+	    << "\"require_distinct_assoc_ids\":" << json_bool(config.require_distinct_assoc_ids)
+	    << "}";
 	return out.str();
 }
 
@@ -1095,27 +1116,35 @@ clear_active_feature(const std::shared_ptr<Session>& session, const std::string&
 }
 
 void
-set_active_fd(const std::shared_ptr<FeatureExecution>& execution, int fd)
+set_active_fds(const std::shared_ptr<FeatureExecution>& execution, std::vector<int> fds)
 {
 	std::lock_guard<std::mutex> lock(execution->mutex);
-	execution->active_fd = fd;
-}
-
-[[nodiscard]] int
-take_active_fd(const std::shared_ptr<FeatureExecution>& execution)
-{
-	std::lock_guard<std::mutex> lock(execution->mutex);
-	const int fd = execution->active_fd;
-	execution->active_fd = -1;
-	return fd;
+	execution->active_fds = std::move(fds);
 }
 
 void
-close_active_fd(const std::shared_ptr<FeatureExecution>& execution)
+set_active_fd(const std::shared_ptr<FeatureExecution>& execution, int fd)
 {
-	const int fd = take_active_fd(execution);
-	if (fd >= 0)
-		close(fd);
+	std::lock_guard<std::mutex> lock(execution->mutex);
+	execution->active_fds = {fd};
+}
+
+[[nodiscard]] std::vector<int>
+take_active_fds(const std::shared_ptr<FeatureExecution>& execution)
+{
+	std::lock_guard<std::mutex> lock(execution->mutex);
+	std::vector<int> fds = std::move(execution->active_fds);
+	execution->active_fds.clear();
+	return fds;
+}
+
+void
+close_active_fds(const std::shared_ptr<FeatureExecution>& execution)
+{
+	for (int fd : take_active_fds(execution)) {
+		if (fd >= 0)
+			close(fd);
+	}
 }
 
 void
@@ -1129,7 +1158,7 @@ mark_failed(const std::shared_ptr<Session>& session, const std::shared_ptr<Featu
 		execution->message = message;
 		execution->finished_at = Clock::now();
 	}
-	close_active_fd(execution);
+	close_active_fds(execution);
 	clear_active_feature(session, execution->definition->id);
 }
 
@@ -1151,7 +1180,7 @@ mark_network_complete(const std::shared_ptr<Session>& session, const std::shared
 			execution->message = "server observed SCTP behavior; waiting for client completion report";
 		}
 	}
-	close_active_fd(execution);
+	close_active_fds(execution);
 	if (finished)
 		clear_active_feature(session, execution->definition->id);
 }
@@ -1171,7 +1200,7 @@ maybe_timeout(const std::shared_ptr<Session>& session, const std::shared_ptr<Fea
 		execution->finished_at = Clock::now();
 		finished = true;
 	}
-	close_active_fd(execution);
+	close_active_fds(execution);
 	if (finished)
 		clear_active_feature(session, execution->definition->id);
 }
@@ -1311,6 +1340,70 @@ run_pr_receive_worker(
 			mark_failed(session, execution, "unexpected SCTP payload for PR-SCTP scenario");
 			return;
 		}
+	}).detach();
+}
+
+void
+run_receive_multi_target_worker(
+    const std::shared_ptr<Session>& session,
+    const std::shared_ptr<FeatureExecution>& execution,
+    std::vector<int> fds,
+    std::vector<MessageSpec> expected_messages)
+{
+	std::thread([session, execution, fds = std::move(fds), expected_messages = std::move(expected_messages)]() {
+		if (fds.size() != expected_messages.size()) {
+			mark_failed(session, execution, "one-to-many scenario is missing listener sockets");
+			return;
+		}
+		char buffer[kBufferSize + 1] = {0};
+		struct iovec iov {};
+		iov.iov_base = buffer;
+		iov.iov_len = kBufferSize;
+		for (size_t i = 0; i < expected_messages.size(); i++) {
+			while (true) {
+				struct sockaddr_storage from {};
+				struct sctp_rcvinfo rcvinfo {};
+				socklen_t fromlen = sizeof(from);
+				socklen_t infolen = sizeof(rcvinfo);
+				unsigned int infotype = SCTP_RECVV_RCVINFO;
+				int flags = 0;
+				const int received = static_cast<int>(sctp_recvv(
+				    fds[i],
+				    &iov,
+				    1,
+				    reinterpret_cast<struct sockaddr*>(&from),
+				    &fromlen,
+				    &rcvinfo,
+				    &infolen,
+				    &infotype,
+				    &flags));
+				if (received < 0) {
+					const int recv_errno = errno;
+					mark_failed(session, execution, recv_errno == EWOULDBLOCK || recv_errno == EAGAIN
+					    ? "timed out waiting for one-to-many SCTP client traffic"
+					    : strerror_string(recv_errno));
+					return;
+				}
+				if ((flags & MSG_NOTIFICATION) != 0)
+					continue;
+				const std::string received_payload(buffer, static_cast<size_t>(received));
+				const MessageSpec& expected = expected_messages[i];
+				if (materialize_payload(expected) != received_payload) {
+					mark_failed(session, execution, "unexpected payload for feature " + execution->definition->id);
+					return;
+				}
+				if (expected.stream != rcvinfo.rcv_sid) {
+					mark_failed(session, execution, "unexpected SCTP stream id");
+					return;
+				}
+				if (expected.ppid != rcvinfo.rcv_ppid) {
+					mark_failed(session, execution, "unexpected SCTP PPID");
+					return;
+				}
+				break;
+			}
+		}
+		mark_network_complete(session, execution);
 	}).detach();
 }
 
@@ -1559,6 +1652,11 @@ rfc_references_for_feature(const std::string& feature_id)
 		return {make_rfc_reference("6458", "8.2.6", "SCTP_GET_ASSOC_ID_LIST")};
 	if (feature_id == "assoc_status_opt_info")
 		return {make_rfc_reference("6458", "8.2.1", "SCTP_STATUS")};
+	if (feature_id == "one_to_many_multi_assoc")
+		return {
+		    make_rfc_reference("6458", "3.1.1", "socket()"),
+		    make_rfc_reference("6458", "3.1.6", "connect()"),
+		};
 	if (feature_id == "stream_reconfig_reset")
 		return {
 		    make_rfc_reference("6525", "4.1", "Outgoing SSN Reset Request Parameter"),
@@ -1992,6 +2090,21 @@ build_feature_catalog()
 	    {},
 	    {},
 	    "Report whether association status information was available and summarize the returned state."));
+	FeatureDefinition one_to_many = make_receive_feature(
+	    "one_to_many_multi_assoc",
+	    "One-to-many multi-association socket",
+	    "one-to-many",
+	    "Use one SCTP socket to create two associations to two reference-server ports and prove they remain distinct.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Open one unconnected one-to-many SCTP socket, send each message to the matching connect address, then report the distinct association ids observed on that one socket.",
+	    {MessageSpec{"otm-one", 1, 101}, MessageSpec{"otm-two", 2, 102}},
+	    {},
+	    {},
+	    "Report the two distinct association ids observed on the single one-to-many client socket.");
+	one_to_many.scenario_kind = ScenarioKind::ReceiveMessagesMultiTarget;
+	one_to_many.one_to_many = OneToManyContract{2, true, true};
+	features.push_back(std::move(one_to_many));
 	features.push_back(make_send_feature(
 	    "stream_reconfig_reset",
 	    "Stream reconfiguration reset",
@@ -2581,7 +2694,8 @@ private:
 		    << "\"finished_at\":" << json_quote(iso_time(execution->finished_at)) << ","
 		    << "\"evidence_kind\":" << json_quote(execution->evidence_kind) << ","
 		    << "\"evidence_text\":" << json_quote(execution->evidence_text) << ","
-		    << "\"report_text\":" << json_quote(execution->report_text);
+		    << "\"report_text\":" << json_quote(execution->report_text) << ","
+		    << "\"assoc_ids\":" << json_array_strings(execution->assoc_ids);
 		if (include_contract && !execution->contract_json.empty())
 			out << ",\"contract\":" << execution->contract_json;
 		out << "}";
@@ -3651,26 +3765,60 @@ private:
 			}
 			contract = build_contract(*execution->definition, {});
 		} else if (execution->definition->scenario_kind == ScenarioKind::ReceiveMessages ||
+		    execution->definition->scenario_kind == ScenarioKind::ReceiveMessagesMultiTarget ||
 		    execution->definition->scenario_kind == ScenarioKind::ReceivePRMessages) {
-			auto socket_info = create_listening_socket(options_, execution->definition->bind_address_count, execution->definition->timeout_seconds, error);
-			if (!socket_info)
-				return {409, json_error(error)};
-			activate_execution(session, execution);
-			set_active_fd(execution, socket_info->fd);
-			{
-				std::lock_guard<std::mutex> session_lock(session->mutex);
-				session->active_feature_id = execution->definition->id;
-			}
-			contract = build_contract(*execution->definition, socket_info->advertise_addrs);
-			if (execution->definition->scenario_kind == ScenarioKind::ReceivePRMessages) {
-				run_pr_receive_worker(session, execution, socket_info->fd, execution->definition->client_send_messages);
+			if (execution->definition->scenario_kind == ScenarioKind::ReceiveMessagesMultiTarget) {
+				const size_t target_count = execution->definition->one_to_many
+				    ? execution->definition->one_to_many->expected_associations
+				    : execution->definition->client_send_messages.size();
+				if (target_count == 0)
+					return {409, json_error("one-to-many feature is missing expected associations")};
+				std::vector<int> fds;
+				std::vector<std::string> connect_addrs;
+				fds.reserve(target_count);
+				connect_addrs.reserve(target_count);
+				for (size_t i = 0; i < target_count; i++) {
+					auto socket_info = create_listening_socket(options_, execution->definition->bind_address_count, execution->definition->timeout_seconds, error);
+					if (!socket_info) {
+						for (int fd : fds) {
+							if (fd >= 0)
+								close(fd);
+						}
+						return {409, json_error(error)};
+					}
+					fds.push_back(socket_info->fd);
+					if (!socket_info->advertise_addrs.empty())
+						connect_addrs.push_back(socket_info->advertise_addrs.front());
+				}
+				activate_execution(session, execution);
+				set_active_fds(execution, fds);
+				{
+					std::lock_guard<std::mutex> session_lock(session->mutex);
+					session->active_feature_id = execution->definition->id;
+				}
+				contract = build_contract(*execution->definition, connect_addrs);
+				run_receive_multi_target_worker(session, execution, std::move(fds), execution->definition->client_send_messages);
 			} else {
-				run_receive_worker(
-				    session,
-				    execution,
-				    socket_info->fd,
-				    execution->definition->client_send_messages,
-				    execution->definition->expected_peer_addr_count);
+				auto socket_info = create_listening_socket(options_, execution->definition->bind_address_count, execution->definition->timeout_seconds, error);
+				if (!socket_info)
+					return {409, json_error(error)};
+				activate_execution(session, execution);
+				set_active_fd(execution, socket_info->fd);
+				{
+					std::lock_guard<std::mutex> session_lock(session->mutex);
+					session->active_feature_id = execution->definition->id;
+				}
+				contract = build_contract(*execution->definition, socket_info->advertise_addrs);
+				if (execution->definition->scenario_kind == ScenarioKind::ReceivePRMessages) {
+					run_pr_receive_worker(session, execution, socket_info->fd, execution->definition->client_send_messages);
+				} else {
+					run_receive_worker(
+					    session,
+					    execution,
+					    socket_info->fd,
+					    execution->definition->client_send_messages,
+					    execution->definition->expected_peer_addr_count);
+				}
 			}
 		} else {
 			auto socket_info = create_listening_socket(options_, execution->definition->bind_address_count, execution->definition->timeout_seconds, error);
@@ -3739,6 +3887,8 @@ private:
 			out << ",\"scheduler\":" << json_scheduler_contract(*feature.scheduler);
 		if (feature.socket_tuning)
 			out << ",\"socket_tuning\":" << json_socket_tuning_contract(*feature.socket_tuning);
+		if (feature.one_to_many)
+			out << ",\"one_to_many\":" << json_one_to_many_contract(*feature.one_to_many);
 		out << "}";
 		return out.str();
 	}
@@ -3746,10 +3896,27 @@ private:
 	HttpResponse CompleteFeature(const std::shared_ptr<Session>& session, const std::shared_ptr<FeatureExecution>& execution, const std::string& body)
 	{
 		maybe_timeout(session, execution);
-		std::map<std::string, std::string> params;
+		JsonValue root;
 		std::string error;
-		if (!parse_simple_json_object(body, params, error))
+		if (!parse_json_root_object(body, root, error))
 			return {400, json_error(error)};
+		auto get_string = [&](const std::string& key) -> std::string {
+			auto it = root.object_value.find(key);
+			if (it == root.object_value.end() || it->second.type != JsonValue::Type::String)
+				return "";
+			return it->second.string_value;
+		};
+		std::vector<std::string> assoc_ids;
+		auto assoc_it = root.object_value.find("assoc_ids");
+		if (assoc_it != root.object_value.end()) {
+			if (assoc_it->second.type != JsonValue::Type::Array)
+				return {400, json_error("assoc_ids must be a JSON array of strings")};
+			for (const JsonValue& value : assoc_it->second.array_value) {
+				if (value.type != JsonValue::Type::String)
+					return {400, json_error("assoc_ids must contain only strings")};
+				assoc_ids.push_back(value.string_value);
+			}
+		}
 		bool finished = false;
 		{
 			std::lock_guard<std::mutex> lock(execution->mutex);
@@ -3757,10 +3924,19 @@ private:
 				return {409, json_error("feature is not active")};
 			if (execution->definition->completion_mode == CompletionMode::ServerObserved)
 				return {409, json_error("feature does not accept client completion reports")};
+			if (execution->definition->one_to_many && execution->definition->one_to_many->require_distinct_assoc_ids) {
+				if (assoc_ids.size() != execution->definition->one_to_many->expected_associations)
+					return {400, json_error("assoc_ids must include exactly two distinct association ids")};
+				std::vector<std::string> sorted = assoc_ids;
+				std::sort(sorted.begin(), sorted.end());
+				if (sorted[0].empty() || sorted[1].empty() || sorted[0] == "0" || sorted[1] == "0" || sorted[0] == sorted[1])
+					return {400, json_error("assoc_ids must include two distinct non-zero association ids")};
+				execution->assoc_ids = assoc_ids;
+			}
 			execution->agent_complete = true;
-			execution->evidence_kind = params["evidence_kind"];
-			execution->evidence_text = params["evidence_text"];
-			execution->report_text = params["report_text"];
+			execution->evidence_kind = get_string("evidence_kind");
+			execution->evidence_text = get_string("evidence_text");
+			execution->report_text = get_string("report_text");
 			if (execution->definition->completion_mode == CompletionMode::AgentReported || execution->network_complete) {
 				execution->state = FeatureState::Passed;
 				execution->message = "scenario completed successfully";
@@ -3771,7 +3947,7 @@ private:
 			}
 		}
 		if (finished)
-			close_active_fd(execution);
+			close_active_fds(execution);
 		if (finished)
 			clear_active_feature(session, execution->definition->id);
 		return {200, FeatureJson(session, execution)};
@@ -3796,7 +3972,7 @@ private:
 			execution->evidence_text = params["evidence_text"];
 			execution->finished_at = Clock::now();
 		}
-		close_active_fd(execution);
+		close_active_fds(execution);
 		clear_active_feature(session, execution->definition->id);
 		return {200, FeatureJson(session, execution)};
 	}
