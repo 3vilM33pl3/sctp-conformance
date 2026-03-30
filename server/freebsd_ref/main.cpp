@@ -3325,8 +3325,11 @@ private:
       const refs = Array.isArray(feature.rfc_references) ? feature.rfc_references : [];
       if (refs.length === 0) return "";
       const links = refs.map((ref) => {
-        const label = `${String(ref.rfc || "").trim()} §${String(ref.section || "").trim()}`.trim();
-        const title = ref.title ? `${label}: ${String(ref.title)}` : label;
+        const rfcText = String(ref.rfc || "").trim();
+        const compactRfc = rfcText.replace(/^RFC\s+/i, "").trim();
+        const label = `${compactRfc} §${String(ref.section || "").trim()}`.trim();
+        const titleLabel = `${rfcText} §${String(ref.section || "").trim()}`.trim();
+        const title = ref.title ? `${titleLabel}: ${String(ref.title)}` : titleLabel;
         return `<a class="rfc-link" href="${escapeHtml(ref.url || "")}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(title)}">${escapeHtml(label)}</a>`;
       }).join("");
       return `
