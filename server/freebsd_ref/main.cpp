@@ -86,13 +86,6 @@ struct FeatureDefinition {
 	size_t expected_peer_addr_count = 0;
 };
 
-struct ClientFeatureMapping {
-	std::string implementation_key;
-	std::string source_symbol;
-	std::string source_path;
-	std::string description;
-};
-
 struct FeatureExecution {
 	explicit FeatureExecution(const FeatureDefinition* feature)
 	    : definition(feature)
@@ -105,7 +98,6 @@ struct FeatureExecution {
 	std::string evidence_kind;
 	std::string evidence_text;
 	std::string report_text;
-	std::optional<ClientFeatureMapping> client_mapping;
 	std::string contract_json;
 	bool network_complete = false;
 	bool agent_complete = false;
@@ -1814,77 +1806,11 @@ private:
 		return out.str();
 	}
 
-	bool ParseSessionCreateRequest(
-	    const std::string& body,
-	    std::map<std::string, std::string>& params,
-	    std::map<std::string, ClientFeatureMapping>& manifest,
-	    std::string& error)
-	{
-		params.clear();
-		manifest.clear();
-		if (body.empty())
-			return true;
-		JsonValue root;
-		if (!parse_json_root_object(body, root, error))
-			return false;
-		for (const auto& [key, value] : root.object_value) {
-			if (key == "client_feature_manifest") {
-				if (value.type != JsonValue::Type::Array) {
-					error = "client_feature_manifest must be a JSON array";
-					return false;
-				}
-				for (const JsonValue& entry : value.array_value) {
-					if (entry.type != JsonValue::Type::Object) {
-						error = "client_feature_manifest entries must be JSON objects";
-						return false;
-					}
-					ClientFeatureMapping mapping;
-					std::string feature_id;
-					for (const auto& [entry_key, entry_value] : entry.object_value) {
-						if (entry_value.type != JsonValue::Type::String) {
-							error = "client_feature_manifest entry values must be JSON strings";
-							return false;
-						}
-						if (entry_key == "feature_id")
-							feature_id = entry_value.string_value;
-						else if (entry_key == "implementation_key")
-							mapping.implementation_key = entry_value.string_value;
-						else if (entry_key == "source_symbol")
-							mapping.source_symbol = entry_value.string_value;
-						else if (entry_key == "source_path")
-							mapping.source_path = entry_value.string_value;
-						else if (entry_key == "description")
-							mapping.description = entry_value.string_value;
-					}
-					if (feature_id.empty()) {
-						error = "client_feature_manifest entry missing feature_id";
-						return false;
-					}
-					if (mapping.implementation_key.empty() || mapping.source_symbol.empty() || mapping.source_path.empty() || mapping.description.empty()) {
-						error = "client_feature_manifest entry missing mapping metadata";
-						return false;
-					}
-					if (FindFeature(feature_id) == nullptr)
-						continue;
-					manifest[feature_id] = std::move(mapping);
-				}
-				continue;
-			}
-			if (value.type != JsonValue::Type::String) {
-				error = "expected string JSON value";
-				return false;
-			}
-			params[key] = value.string_value;
-		}
-		return true;
-	}
-
 	HttpResponse CreateSession(const std::string& body)
 	{
 		std::map<std::string, std::string> params;
-		std::map<std::string, ClientFeatureMapping> manifest;
 		std::string error;
-		if (!ParseSessionCreateRequest(body, params, manifest, error))
+		if (!parse_simple_json_object(body, params, error))
 			return {400, json_error(error)};
 		auto session = std::make_shared<Session>();
 		session->id = RandomId();
@@ -1893,9 +1819,6 @@ private:
 		session->created_at = Clock::now();
 		for (const FeatureDefinition& feature : feature_catalog_) {
 			auto execution = std::make_shared<FeatureExecution>(&feature);
-			auto it = manifest.find(feature.id);
-			if (it != manifest.end())
-				execution->client_mapping = it->second;
 			session->features.emplace(feature.id, std::move(execution));
 		}
 		{
@@ -2002,15 +1925,6 @@ private:
 		    << "\"evidence_kind\":" << json_quote(execution->evidence_kind) << ","
 		    << "\"evidence_text\":" << json_quote(execution->evidence_text) << ","
 		    << "\"report_text\":" << json_quote(execution->report_text);
-		if (execution->client_mapping.has_value()) {
-			const ClientFeatureMapping& mapping = *execution->client_mapping;
-			out << ",\"client_mapping\":{"
-			    << "\"implementation_key\":" << json_quote(mapping.implementation_key) << ","
-			    << "\"source_symbol\":" << json_quote(mapping.source_symbol) << ","
-			    << "\"source_path\":" << json_quote(mapping.source_path) << ","
-			    << "\"description\":" << json_quote(mapping.description)
-			    << "}";
-		}
 		if (include_contract && !execution->contract_json.empty())
 			out << ",\"contract\":" << execution->contract_json;
 		out << "}";
@@ -2724,40 +2638,6 @@ private:
       max-width: 60ch;
     }
 
-    .feature-mapping {
-      margin-top: 14px;
-      padding: 14px;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: rgba(255, 255, 255, 0.56);
-    }
-
-    .mapping-row {
-      display: grid;
-      grid-template-columns: 116px minmax(0, 1fr);
-      gap: 10px;
-      font-size: 0.8rem;
-      line-height: 1.45;
-      align-items: start;
-    }
-
-    .mapping-row + .mapping-row {
-      margin-top: 6px;
-    }
-
-    .mapping-label {
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      font-size: 0.72rem;
-    }
-
-    .mapping-value {
-      overflow-wrap: anywhere;
-      font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
-      min-width: 0;
-    }
-
     .feature-time {
       margin-top: auto;
       padding-top: 16px;
@@ -2796,7 +2676,6 @@ private:
 
     @media (max-width: 900px) {
       .feature-grid { grid-template-columns: 1fr; }
-      .mapping-row { grid-template-columns: 1fr; gap: 3px; }
     }
 
     @media (max-width: 720px) {
@@ -2930,28 +2809,6 @@ private:
       `).join("");
     }
 
-    function renderClientMapping(feature) {
-      const mapping = feature.client_mapping;
-      if (!mapping) return "";
-      const rows = [
-        ["Implementation", mapping.implementation_key],
-        ["Go symbol", mapping.source_symbol],
-        ["Source", mapping.source_path],
-        ["Description", mapping.description],
-      ].filter(([, value]) => value);
-      if (rows.length === 0) return "";
-      return `
-        <div class="feature-mapping">
-          ${rows.map(([label, value]) => `
-            <div class="mapping-row">
-              <div class="mapping-label">${escapeHtml(label)}</div>
-              <div class="mapping-value">${escapeHtml(value)}</div>
-            </div>
-          `).join("")}
-        </div>
-      `;
-    }
-
     function renderFeatures(summary) {
       const features = Array.isArray(summary.features) ? summary.features : [];
       emptyStateEl.hidden = features.length !== 0;
@@ -2967,7 +2824,6 @@ private:
               <div class="state-pill" data-tone="${tone}">${escapeHtml(feature.state)}</div>
             </div>
             <div class="feature-message">${escapeHtml(feature.message || "no status message")}</div>
-            ${renderClientMapping(feature)}
             <div class="feature-time">
               <div>Started: ${escapeHtml(formatTimestamp(feature.started_at))}</div>
               <div>Finished: ${escapeHtml(formatTimestamp(feature.finished_at))}</div>
