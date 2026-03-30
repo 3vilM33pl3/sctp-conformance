@@ -1,0 +1,16 @@
+# Project-owned memory behavior.
+# Less technical users should customize Memory Layer here.
+
+[project]
+slug = "sctp-conformance"
+repo_root = "/home/olivier/Projects/sctp/sctp-conformance"
+
+[capture]
+include_paths = ["README.md", "docs/", "src/", "crates/", "scripts/", "packaging/"]
+ignore_paths = [".git/", "target/", ".mem/", "node_modules/"]
+
+[analysis]
+analyzers = ["rust", "typescript", "python"]
+
+[retrieval]
+graph_enabled = false
