@@ -12,6 +12,9 @@ attempting scenarios.
 
 ![Session dashboard](docs/images/dashboard-demo.png)
 
+Each feature card links to the relevant RFC section or sections defining the
+behavior under test.
+
 ## How It Works
 
 The primary interface is a FreeBSD-resident SCTP feature server.
@@ -135,6 +138,7 @@ GET  /v1/sessions/{sessionId}/summary
 `GET /` serves a live session index page with links to every in-memory session dashboard.
 
 `POST /v1/sessions` returns a `dashboard_path` for the live session board. The dashboard uses the summary snapshot and the summary SSE stream to show pending, active, passed, failed, timed-out, and unsupported feature states in realtime.
+Per-feature cards also show RFC links sourced from the server-side feature catalog.
 
 ## Contract Lifecycle
 

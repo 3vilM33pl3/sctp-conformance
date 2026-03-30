@@ -42,6 +42,8 @@ Returns the feature catalog and the completion mode for each feature:
 - `hybrid`: the server must observe SCTP behavior and the client must report local success
 
 The catalog is the authoritative list of features an agent should attempt.
+Each feature entry also includes `rfc_references`, an array of RFC section
+links used by the built-in dashboard.
 
 ### `POST /v1/sessions`
 
@@ -67,12 +69,14 @@ Returns the current session metadata, including:
 - `active_feature_id`
 - `dashboard_path`
 - per-feature state snapshots
+- per-feature `rfc_references`
 
 ### `GET /sessions/{sessionId}/dashboard`
 
 Serves the built-in single-session traffic-light dashboard.
 
 The page bootstraps from `GET /v1/sessions/{sessionId}` and `GET /v1/sessions/{sessionId}/summary`, then subscribes to `GET /v1/sessions/{sessionId}/summary/stream`.
+Each feature card includes one or more RFC links derived from the server-side feature catalog.
 
 ### `POST /v1/sessions/{sessionId}/features/{featureId}/start`
 
@@ -123,6 +127,9 @@ Returns the aggregate session state:
 - `pending_or_active`
 - `complete`
 - `features`
+
+Each entry in `features` includes `rfc_references` with RFC number, section,
+title, and URL.
 
 ### `GET /v1/sessions/{sessionId}/summary/stream`
 

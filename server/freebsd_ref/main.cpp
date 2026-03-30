@@ -112,6 +112,13 @@ struct FeatureDefinition {
 	std::string title;
 	std::string category;
 	std::string summary;
+	struct RfcReference {
+		std::string rfc;
+		std::string section;
+		std::string title;
+		std::string url;
+	};
+	std::vector<RfcReference> rfc_references;
 	std::string instructions_text;
 	CompletionMode completion_mode = CompletionMode::ServerObserved;
 	ScenarioKind scenario_kind = ScenarioKind::AgentOnly;
@@ -370,6 +377,36 @@ json_array_uint8(const std::vector<uint8_t>& values)
 json_bool(bool value)
 {
 	return value ? "true" : "false";
+}
+
+[[nodiscard]] FeatureDefinition::RfcReference
+make_rfc_reference(const std::string& rfc_number, const std::string& section, const std::string& title)
+{
+	return {
+	    "RFC " + rfc_number,
+	    section,
+	    title,
+	    "https://www.rfc-editor.org/rfc/rfc" + rfc_number + ".html#section-" + section,
+	};
+}
+
+[[nodiscard]] std::string
+json_rfc_references(const std::vector<FeatureDefinition::RfcReference>& values)
+{
+	std::ostringstream out;
+	out << "[";
+	for (size_t i = 0; i < values.size(); i++) {
+		if (i != 0)
+			out << ",";
+		out << "{"
+		    << "\"rfc\":" << json_quote(values[i].rfc) << ","
+		    << "\"section\":" << json_quote(values[i].section) << ","
+		    << "\"title\":" << json_quote(values[i].title) << ","
+		    << "\"url\":" << json_quote(values[i].url)
+		    << "}";
+	}
+	out << "]";
+	return out.str();
 }
 
 [[nodiscard]] std::string
@@ -1413,6 +1450,120 @@ make_send_feature(
 	return feature;
 }
 
+[[nodiscard]] std::vector<FeatureDefinition::RfcReference>
+rfc_references_for_feature(const std::string& feature_id)
+{
+	if (feature_id == "socket_create")
+		return {make_rfc_reference("6458", "4.1.1", "socket()")};
+	if (feature_id == "bind_listen_connect")
+		return {
+		    make_rfc_reference("6458", "4.1.2", "bind()"),
+		    make_rfc_reference("6458", "4.1.5", "connect()"),
+		};
+	if (feature_id == "single_message_boundary" || feature_id == "multi_message_boundary" || feature_id == "stream_id"
+	    || feature_id == "ppid" || feature_id == "unordered_delivery")
+		return {make_rfc_reference("9260", "3.3.1", "Payload Data (DATA) Chunk")};
+	if (feature_id == "nodelay")
+		return {make_rfc_reference("6458", "8.1.5", "SCTP_NODELAY")};
+	if (feature_id == "initmsg")
+		return {make_rfc_reference("6458", "8.1.3", "Initialization Parameters (SCTP_INITMSG)")};
+	if (feature_id == "rto_assoc_parameters")
+		return {make_rfc_reference("6458", "8.1.1", "Retransmission Timeout Parameters (SCTP_RTOINFO)")};
+	if (feature_id == "notifications" || feature_id == "event_subscription_matrix")
+		return {
+		    make_rfc_reference("6458", "6.2.2", "SCTP_EVENT Option"),
+		    make_rfc_reference("6458", "6.1.1", "SCTP_ASSOC_CHANGE"),
+		};
+	if (feature_id == "association_shutdown_notifications")
+		return {
+		    make_rfc_reference("6458", "6.1.1", "SCTP_ASSOC_CHANGE"),
+		    make_rfc_reference("6458", "6.1.5", "SCTP_SHUTDOWN_EVENT"),
+		};
+	if (feature_id == "multi_bind")
+		return {
+		    make_rfc_reference("9260", "3.3.2.1", "Optional or Variable-Length Parameters in INIT Chunks"),
+		    make_rfc_reference("9260", "3.3.3.1", "Optional or Variable-Length Parameters in INIT ACK Chunks"),
+		};
+	if (feature_id == "local_addr_enum")
+		return {make_rfc_reference("6458", "9.5", "sctp_getladdrs()")};
+	if (feature_id == "peer_addr_enum")
+		return {make_rfc_reference("6458", "9.3", "sctp_getpaddrs()")};
+	if (feature_id == "negative_connect_error")
+		return {make_rfc_reference("6458", "4.1.5", "connect()")};
+	if (feature_id == "default_sndinfo_recvrcvinfo")
+		return {
+		    make_rfc_reference("6458", "8.1.29", "SCTP_RECVRCVINFO"),
+		    make_rfc_reference("6458", "8.1.31", "SCTP_DEFAULT_SNDINFO"),
+		};
+	if (feature_id == "recvnxtinfo")
+		return {make_rfc_reference("6458", "8.1.30", "SCTP_RECVNXTINFO")};
+	if (feature_id == "autoclose")
+		return {make_rfc_reference("6458", "8.1.8", "SCTP_AUTOCLOSE")};
+	if (feature_id == "bindx_add_remove")
+		return {make_rfc_reference("6458", "9.1", "sctp_bindx()")};
+	if (feature_id == "primary_addr_management")
+		return {make_rfc_reference("6458", "8.1.9", "SCTP_PRIMARY_ADDR")};
+	if (feature_id == "peer_primary_addr_request")
+		return {make_rfc_reference("6458", "8.3.1", "SCTP_SET_PEER_PRIMARY_ADDR")};
+	if (feature_id == "peeloff_assoc")
+		return {make_rfc_reference("6458", "9.2", "sctp_peeloff()")};
+	if (feature_id == "assoc_id_listing")
+		return {make_rfc_reference("6458", "8.2.6", "SCTP_GET_ASSOC_ID_LIST")};
+	if (feature_id == "assoc_status_opt_info")
+		return {make_rfc_reference("6458", "8.2.1", "SCTP_STATUS")};
+	if (feature_id == "stream_reconfig_reset")
+		return {
+		    make_rfc_reference("6525", "4.1", "Outgoing SSN Reset Request Parameter"),
+		    make_rfc_reference("6525", "4.2", "Incoming SSN Reset Request Parameter"),
+		};
+	if (feature_id == "stream_reconfig_add_streams")
+		return {
+		    make_rfc_reference("6525", "4.5", "Add Outgoing Streams Request Parameter"),
+		    make_rfc_reference("6525", "4.6", "Add Incoming Streams Request Parameter"),
+		};
+	if (feature_id == "pr_sctp_ttl")
+		return {
+		    make_rfc_reference("3758", "3.5", "Sender Side Implementation of PR-SCTP"),
+		    make_rfc_reference("3758", "4.1", "PR-SCTP Service Definition for Timed Reliability"),
+		};
+	if (feature_id == "pr_sctp_rtx")
+		return {
+		    make_rfc_reference("3758", "3.5", "Sender Side Implementation of PR-SCTP"),
+		    make_rfc_reference("3758", "4.3", "Guidelines for Defining Other PR-SCTP Services"),
+		};
+	if (feature_id == "auth_required_chunks")
+		return {
+		    make_rfc_reference("4895", "3.2", "Chunk List Parameter (CHUNKS)"),
+		    make_rfc_reference("4895", "6.2", "Sending Authenticated Chunks"),
+		};
+	if (feature_id == "auth_key_rotation")
+		return {
+		    make_rfc_reference("4895", "6.1", "Establishment of an Association Shared Key"),
+		    make_rfc_reference("4895", "6.2", "Sending Authenticated Chunks"),
+		};
+	if (feature_id == "asconf_add_remove")
+		return {
+		    make_rfc_reference("5061", "4.2.1", "Add IP Address"),
+		    make_rfc_reference("5061", "4.2.2", "Delete IP Address"),
+		};
+	if (feature_id == "idata_interleaving")
+		return {
+		    make_rfc_reference("8260", "2.1", "The I-DATA Chunk Supporting User Message Interleaving"),
+		    make_rfc_reference("8260", "2.2.1", "Negotiation"),
+		};
+	if (feature_id == "stream_scheduler_policy")
+		return {
+		    make_rfc_reference("8260", "3.4", "Priority-Based Scheduler (SCTP_SS_PRIO)"),
+		    make_rfc_reference("8260", "4.3.2", "SCTP_STREAM_SCHEDULER"),
+		};
+	if (feature_id == "stream_scheduler_value")
+		return {
+		    make_rfc_reference("8260", "3.4", "Priority-Based Scheduler (SCTP_SS_PRIO)"),
+		    make_rfc_reference("8260", "4.3.3", "SCTP_STREAM_SCHEDULER_VALUE"),
+		};
+	return {};
+}
+
 [[nodiscard]] std::vector<FeatureDefinition>
 build_feature_catalog()
 {
@@ -1871,6 +2022,8 @@ build_feature_catalog()
 	    "Report the per-stream scheduler values attempted and whether the calls succeeded.");
 	scheduler_value.scheduler = SchedulerContract{"priority", 20, 21, 64, 4, 12};
 	features.push_back(std::move(scheduler_value));
+	for (FeatureDefinition& feature : features)
+		feature.rfc_references = rfc_references_for_feature(feature.id);
 	return features;
 }
 
@@ -2164,6 +2317,7 @@ private:
 			    << "\"summary\":" << json_quote(feature.summary) << ","
 			    << "\"completion_mode\":" << json_quote(to_string(feature.completion_mode)) << ","
 			    << "\"manual_setup_required\":" << json_bool(feature.manual_setup_required) << ","
+			    << "\"rfc_references\":" << json_rfc_references(feature.rfc_references) << ","
 			    << "\"timeout_seconds\":" << feature.timeout_seconds
 			    << "}";
 		}
@@ -2285,6 +2439,7 @@ private:
 		    << "\"completion_mode\":" << json_quote(to_string(execution->definition->completion_mode)) << ","
 		    << "\"manual_setup_required\":" << json_bool(execution->definition->manual_setup_required) << ","
 		    << "\"manual_setup_instructions\":" << json_array_strings(execution->definition->manual_setup_instructions) << ","
+		    << "\"rfc_references\":" << json_rfc_references(execution->definition->rfc_references) << ","
 		    << "\"state\":" << json_quote(to_string(execution->state)) << ","
 		    << "\"message\":" << json_quote(execution->message) << ","
 		    << "\"started_at\":" << json_quote(iso_time(execution->started_at)) << ","
@@ -3006,6 +3161,34 @@ private:
       max-width: 60ch;
     }
 
+    .rfc-row {
+      margin-top: 14px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: baseline;
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    .rfc-links {
+      display: inline-flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .rfc-link {
+      color: var(--ink);
+      text-decoration: none;
+      border-bottom: 1px solid rgba(24, 33, 38, 0.24);
+      padding-bottom: 1px;
+    }
+
+    .rfc-link:hover {
+      border-bottom-color: currentColor;
+    }
+
     .feature-time {
       margin-top: auto;
       padding-top: 16px;
@@ -3138,6 +3321,22 @@ private:
       return "gray";
     }
 
+    function renderRFCReferences(feature) {
+      const refs = Array.isArray(feature.rfc_references) ? feature.rfc_references : [];
+      if (refs.length === 0) return "";
+      const links = refs.map((ref) => {
+        const label = `${String(ref.rfc || "").trim()} §${String(ref.section || "").trim()}`.trim();
+        const title = ref.title ? `${label}: ${String(ref.title)}` : label;
+        return `<a class="rfc-link" href="${escapeHtml(ref.url || "")}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(title)}">${escapeHtml(label)}</a>`;
+      }).join("");
+      return `
+        <div class="rfc-row">
+          <span>RFC</span>
+          <span class="rfc-links">${links}</span>
+        </div>
+      `;
+    }
+
     function setConnection(state, label) {
       connectionEl.dataset.state = state;
       connectionEl.textContent = label;
@@ -3194,6 +3393,7 @@ private:
             </div>
           `
           : "";
+        const rfcReferences = renderRFCReferences(feature);
         return `
           <article class="feature-card" data-tone="${tone}">
             <div class="feature-head">
@@ -3205,6 +3405,7 @@ private:
             </div>
             <div class="feature-message">${escapeHtml(feature.message || "no status message")}</div>
             ${manualNote}
+            ${rfcReferences}
             <div class="feature-time">
               <div>Started: ${escapeHtml(formatTimestamp(feature.started_at))}</div>
               <div>Finished: ${escapeHtml(formatTimestamp(feature.finished_at))}</div>
