@@ -42,7 +42,7 @@ This repository is designed for LLM-assisted client development.
 The current published Go client is in `clients/go-sctp/misc/sctp-feature-client/go`.
 
 If you want a concrete operator guide for prompting a coding agent, see
-[docs/instruct-coding-agent.md](/home/olivier/Projects/sctp/sctp-conformance/docs/instruct-coding-agent.md).
+[docs/instruct-coding-agent.md](docs/instruct-coding-agent.md).
 
 ## Clone And Bootstrap
 
@@ -115,7 +115,7 @@ If you want remote multihoming scenarios to use non-loopback addresses, add thos
 
 ## Agent Flow
 
-The control plane is documented in [docs/agent-http-api.md](/home/olivier/Projects/sctp/sctp-conformance/docs/agent-http-api.md).
+The control plane is documented in [docs/agent-http-api.md](docs/agent-http-api.md).
 
 Minimal flow:
 
@@ -214,7 +214,7 @@ The smoke test exercises:
 
 ## Licensing
 
-`sctp-conformance` itself is licensed under the BSD 2-Clause License. See [LICENSE](/home/olivier/Projects/sctp/sctp-conformance/LICENSE).
+`sctp-conformance` itself is licensed under the BSD 2-Clause License. See [LICENSE](LICENSE).
 
 That top-level license does not replace or override the licenses of the client submodules under `clients/`. Those are separate repositories with their own license terms:
 

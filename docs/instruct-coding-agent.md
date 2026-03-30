@@ -107,5 +107,5 @@ server requests.
 
 ## Useful References
 
-- [Agent HTTP API](/home/olivier/Projects/sctp/sctp-conformance/docs/agent-http-api.md)
-- [Main README](/home/olivier/Projects/sctp/sctp-conformance/README.md)
+- [Agent HTTP API](agent-http-api.md)
+- [Main README](../README.md)
