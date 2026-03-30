@@ -77,6 +77,42 @@ cd clients/go-sctp
 GOROOT=$(pwd) ./bin/go build ./misc/sctp-feature-client/go
 ```
 
+The Rust feature client is built against the in-tree `std::net` SCTP API in
+`clients/rust-sctp`. In the published fork, the simplest reproducible setup is
+to disable CI LLVM downloads and let `x.py` build LLVM from the pinned
+`src/llvm-project` submodule. The commands below assume the current Linux host
+triple is `x86_64-unknown-linux-gnu`:
+
+```sh
+cd clients/rust-sctp
+cat > bootstrap.toml <<'EOF'
+change-id = "ignore"
+profile = "library"
+[llvm]
+download-ci-llvm = false
+EOF
+python3 x.py build library/std --stage 1
+RUSTC="$(pwd)/build/x86_64-unknown-linux-gnu/stage1/bin/rustc" \
+RUSTFLAGS="--sysroot=$(pwd)/build/x86_64-unknown-linux-gnu/stage1" \
+cargo run --manifest-path src/tools/sctp-feature-client/Cargo.toml -- --list-scenarios
+```
+
+The first Rust build is heavy because it compiles LLVM locally and expects
+`cmake`, `ninja`, `clang`, and `c++` to be available on the Linux host.
+
+To drive the FreeBSD conformance server from the Rust client:
+
+```sh
+cd clients/rust-sctp
+RUSTC="$(pwd)/build/x86_64-unknown-linux-gnu/stage1/bin/rustc" \
+RUSTFLAGS="--sysroot=$(pwd)/build/x86_64-unknown-linux-gnu/stage1" \
+cargo run --manifest-path src/tools/sctp-feature-client/Cargo.toml -- \
+  --base-url http://free.metatao.net:18080
+```
+
+Manual-setup Rust scenarios stay skipped by default and only run with
+`--include-manual-setup` or an explicit `--features` list.
+
 ## FreeBSD Server
 
 Build on the FreeBSD host with base tools:
