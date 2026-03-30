@@ -170,12 +170,14 @@ The current server catalog covers:
 - `SCTP_MAX_BURST`
 - notifications
 - event subscription coverage and shutdown notifications
+- peer-address-change notifications with explicit manual path-state setup
 - multihome bind/connect and address enumeration
 - `SCTP_BINDX` add/remove
 - primary-address management requests
 - negative connect error handling
 - `SCTP_DEFAULT_SNDINFO` and server-side receive metadata checks
 - large-message reassembly and `SCTP_MAXSEG` fragmentation checks
+- partial-delivery notifications with explicit manual receive-buffer tuning
 - `SCTP_RECVNXTINFO`
 - unordered delivery attempts
 - `SCTP_AUTOCLOSE`

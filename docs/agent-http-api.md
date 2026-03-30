@@ -89,6 +89,8 @@ Starts one feature in the session and returns a scenario contract containing:
 - required messages to send
 - optional messages the server will send
 - optional per-feature tuning objects such as `socket_tuning`
+- optional `manual_setup_required` and `manual_setup_instructions` when the feature
+  only makes sense after operator-applied network or host tuning
 - timeout and completion mode
 - reporting instructions
 

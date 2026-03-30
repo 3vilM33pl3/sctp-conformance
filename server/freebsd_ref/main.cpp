@@ -1508,10 +1508,20 @@ rfc_references_for_feature(const std::string& feature_id)
 		    make_rfc_reference("6458", "6.2.2", "SCTP_EVENT Option"),
 		    make_rfc_reference("6458", "6.1.1", "SCTP_ASSOC_CHANGE"),
 		};
+	if (feature_id == "peer_addr_change_notifications")
+		return {
+		    make_rfc_reference("6458", "6.1.2", "SCTP_PEER_ADDR_CHANGE"),
+		    make_rfc_reference("6458", "6.2.2", "SCTP_EVENT Option"),
+		};
 	if (feature_id == "association_shutdown_notifications")
 		return {
 		    make_rfc_reference("6458", "6.1.1", "SCTP_ASSOC_CHANGE"),
 		    make_rfc_reference("6458", "6.1.5", "SCTP_SHUTDOWN_EVENT"),
+		};
+	if (feature_id == "partial_delivery_event")
+		return {
+		    make_rfc_reference("6458", "6.1.7", "SCTP_PARTIAL_DELIVERY_EVENT"),
+		    make_rfc_reference("6458", "6.2.2", "SCTP_EVENT Option"),
 		};
 	if (feature_id == "multi_bind")
 		return {
@@ -1759,6 +1769,41 @@ build_feature_catalog()
 	    {MessageSpec{"server-shutdown-notify", 5, 53}},
 	    {"association", "shutdown"},
 	    "Report the association-change and shutdown notifications observed by the client."));
+	FeatureDefinition peer_addr_change = make_send_feature(
+	    "peer_addr_change_notifications",
+	    "Peer address change notifications",
+	    "path-management",
+	    "Observe peer-address-change notifications while establishing and using a multihomed association.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Subscribe to address and association notifications, connect to the multihomed reference server, send the trigger payload, receive the server message, and report the peer-address notifications observed.",
+	    "peer-addr-change-ready",
+	    {MessageSpec{"server-peer-addr-change", 14, 1401}},
+	    {"association", "address", "dataio"},
+	    "Report the SCTP_PEER_ADDR_CHANGE notifications observed by the client during association setup or early traffic.");
+	peer_addr_change.bind_address_count = 2;
+	peer_addr_change.manual_setup_required = true;
+	peer_addr_change.manual_setup_instructions = {
+	    "After the association is established, induce a real path-state transition on one advertised server address before rerunning this feature.",
+	    "Example: temporarily block SCTP traffic to one server address or withdraw one advertised path so the client can observe SCTP_PEER_ADDR_CHANGE."};
+	features.push_back(std::move(peer_addr_change));
+	FeatureDefinition partial_delivery = make_send_feature(
+	    "partial_delivery_event",
+	    "Partial delivery event",
+	    "notifications",
+	    "Receive a very large SCTP user message and observe partial-delivery notifications while it is surfaced to the application.",
+	    CompletionMode::Hybrid,
+	    25,
+	    "Subscribe to partial-delivery notifications, connect to the server, send the trigger payload, receive the large server message, and report whether SCTP_PARTIAL_DELIVERY_EVENT was observed.",
+	    "partial-delivery-ready",
+	    {MessageSpec{"partial-delivery", 25, 2501, 1048576}},
+	    {"partial_delivery", "dataio"},
+	    "Report whether SCTP_PARTIAL_DELIVERY_EVENT was observed while the large message was delivered.");
+	partial_delivery.manual_setup_required = true;
+	partial_delivery.manual_setup_instructions = {
+	    "Tune the client host so very large inbound SCTP messages trigger partial delivery before rerunning this feature.",
+	    "Example: reduce the effective SCTP receive buffer / partial-delivery threshold on the client host, then rerun with --include-manual-setup."};
+	features.push_back(std::move(partial_delivery));
 	features.push_back(make_receive_feature(
 	    "multi_bind",
 	    "Multihome reference server",
@@ -3620,7 +3665,12 @@ private:
 			if (execution->definition->scenario_kind == ScenarioKind::ReceivePRMessages) {
 				run_pr_receive_worker(session, execution, socket_info->fd, execution->definition->client_send_messages);
 			} else {
-				run_receive_worker(session, execution, socket_info->fd, execution->definition->client_send_messages, execution->definition->expected_peer_addr_count);
+				run_receive_worker(
+				    session,
+				    execution,
+				    socket_info->fd,
+				    execution->definition->client_send_messages,
+				    execution->definition->expected_peer_addr_count);
 			}
 		} else {
 			auto socket_info = create_listening_socket(options_, execution->definition->bind_address_count, execution->definition->timeout_seconds, error);
