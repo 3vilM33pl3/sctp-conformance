@@ -43,6 +43,9 @@ This repository is designed for LLM-assisted client development.
 
 The current published Go client is in `clients/go-sctp/misc/sctp-feature-client/go`.
 
+If you want a concrete operator guide for prompting a coding agent, see
+[docs/instruct-coding-agent.md](/home/olivier/Projects/sctp/sctp-conformance/docs/instruct-coding-agent.md).
+
 ## Clone And Bootstrap
 
 Clone with submodules:
@@ -181,6 +184,7 @@ The current server catalog covers:
 - `clients/go-sctp/`: Go runtime fork used for Go client generation
 - `clients/rust-sctp/`: Rust runtime fork used for Rust client generation
 - `docs/agent-http-api.md`: HTTP control plane used by coding agents
+- `docs/instruct-coding-agent.md`: operator guide for prompting a coding agent to build a client
 - `docs/images/dashboard-demo.png`: README dashboard screenshot
 - `scripts/smoke_feature_server.py`: acceptance smoke test for the server API and SCTP data plane
 - `adapters/freebsd_c/`: FreeBSD C helper used for smoke testing and baseline validation
