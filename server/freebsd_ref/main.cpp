@@ -86,6 +86,13 @@ struct FeatureDefinition {
 	size_t expected_peer_addr_count = 0;
 };
 
+struct ClientFeatureMapping {
+	std::string implementation_key;
+	std::string source_symbol;
+	std::string source_path;
+	std::string description;
+};
+
 struct FeatureExecution {
 	explicit FeatureExecution(const FeatureDefinition* feature)
 	    : definition(feature)
@@ -98,6 +105,7 @@ struct FeatureExecution {
 	std::string evidence_kind;
 	std::string evidence_text;
 	std::string report_text;
+	std::optional<ClientFeatureMapping> client_mapping;
 	std::string contract_json;
 	bool network_complete = false;
 	bool agent_complete = false;
@@ -406,134 +414,148 @@ append_utf8_codepoint(uint32_t codepoint, std::ostringstream& buffer)
 	return false;
 }
 
-bool
-parse_simple_json_object(const std::string& input, std::map<std::string, std::string>& out, std::string& error)
-{
-	size_t i = 0;
-	auto skip_ws = [&]() {
-		while (i < input.size() && std::isspace(static_cast<unsigned char>(input[i])))
-			i++;
+struct JsonValue {
+	enum class Type {
+		String,
+		Object,
+		Array,
 	};
-	auto parse_string = [&](std::string& out_value) -> bool {
-		if (i >= input.size() || input[i] != '"') {
-			error = "expected JSON string";
-			return false;
-		}
+
+	Type type = Type::String;
+	std::string string_value;
+	std::map<std::string, JsonValue> object_value;
+	std::vector<JsonValue> array_value;
+};
+
+void
+skip_json_ws(const std::string& input, size_t& i)
+{
+	while (i < input.size() && std::isspace(static_cast<unsigned char>(input[i])))
 		i++;
-		std::ostringstream buffer;
-		while (i < input.size()) {
-			char ch = input[i++];
-			if (ch == '"') {
-				out_value = buffer.str();
-				return true;
+}
+
+bool
+parse_json_string_value(const std::string& input, size_t& i, std::string& out_value, std::string& error)
+{
+	if (i >= input.size() || input[i] != '"') {
+		error = "expected JSON string";
+		return false;
+	}
+	i++;
+	std::ostringstream buffer;
+	while (i < input.size()) {
+		char ch = input[i++];
+		if (ch == '"') {
+			out_value = buffer.str();
+			return true;
+		}
+		if (ch == '\\') {
+			if (i >= input.size()) {
+				error = "invalid JSON escape";
+				return false;
 			}
-			if (ch == '\\') {
-				if (i >= input.size()) {
-					error = "invalid JSON escape";
+			char esc = input[i++];
+			switch (esc) {
+			case '"':
+			case '\\':
+			case '/':
+				buffer << esc;
+				break;
+			case 'b':
+				buffer << '\b';
+				break;
+			case 'f':
+				buffer << '\f';
+				break;
+			case 'n':
+				buffer << '\n';
+				break;
+			case 'r':
+				buffer << '\r';
+				break;
+			case 't':
+				buffer << '\t';
+				break;
+			case 'u': {
+				if (i + 4 > input.size()) {
+					error = "invalid JSON unicode escape";
 					return false;
 				}
-				char esc = input[i++];
-				switch (esc) {
-				case '"':
-				case '\\':
-				case '/':
-					buffer << esc;
-					break;
-				case 'b':
-					buffer << '\b';
-					break;
-				case 'f':
-					buffer << '\f';
-					break;
-				case 'n':
-					buffer << '\n';
-					break;
-				case 'r':
-					buffer << '\r';
-					break;
-				case 't':
-					buffer << '\t';
-					break;
-				case 'u': {
-					if (i + 4 > input.size()) {
+				uint32_t codepoint = 0;
+				for (size_t hex = 0; hex < 4; ++hex) {
+					char digit = input[i++];
+					codepoint <<= 4;
+					if (digit >= '0' && digit <= '9')
+						codepoint |= static_cast<uint32_t>(digit - '0');
+					else if (digit >= 'a' && digit <= 'f')
+						codepoint |= static_cast<uint32_t>(digit - 'a' + 10);
+					else if (digit >= 'A' && digit <= 'F')
+						codepoint |= static_cast<uint32_t>(digit - 'A' + 10);
+					else {
 						error = "invalid JSON unicode escape";
 						return false;
 					}
-					uint32_t codepoint = 0;
-					for (size_t hex = 0; hex < 4; ++hex) {
-						char digit = input[i++];
-						codepoint <<= 4;
-						if (digit >= '0' && digit <= '9')
-							codepoint |= static_cast<uint32_t>(digit - '0');
-						else if (digit >= 'a' && digit <= 'f')
-							codepoint |= static_cast<uint32_t>(digit - 'a' + 10);
-						else if (digit >= 'A' && digit <= 'F')
-							codepoint |= static_cast<uint32_t>(digit - 'A' + 10);
-						else {
-							error = "invalid JSON unicode escape";
-							return false;
-						}
-					}
-					if (!append_utf8_codepoint(codepoint, buffer)) {
-						error = "unsupported JSON unicode escape";
-						return false;
-					}
-					break;
 				}
-				default:
-					error = "unsupported JSON escape";
+				if (!append_utf8_codepoint(codepoint, buffer)) {
+					error = "unsupported JSON unicode escape";
 					return false;
 				}
-			} else {
-				buffer << ch;
+				break;
 			}
+			default:
+				error = "unsupported JSON escape";
+				return false;
+			}
+		} else {
+			buffer << ch;
 		}
-		error = "unterminated JSON string";
-		return false;
-	};
-	skip_ws();
+	}
+	error = "unterminated JSON string";
+	return false;
+}
+
+bool parse_json_value(const std::string& input, size_t& i, JsonValue& out, std::string& error);
+
+bool
+parse_json_object_value(const std::string& input, size_t& i, JsonValue& out, std::string& error)
+{
+	skip_json_ws(input, i);
 	if (i >= input.size() || input[i] != '{') {
 		error = "expected JSON object";
 		return false;
 	}
+	out.type = JsonValue::Type::Object;
+	out.object_value.clear();
 	i++;
-	skip_ws();
-	if (i < input.size() && input[i] == '}')
+	skip_json_ws(input, i);
+	if (i < input.size() && input[i] == '}') {
+		i++;
 		return true;
+	}
 	while (i < input.size()) {
 		std::string key;
-		std::string value;
-		skip_ws();
-		if (!parse_string(key))
+		JsonValue value;
+		skip_json_ws(input, i);
+		if (!parse_json_string_value(input, i, key, error))
 			return false;
-		skip_ws();
+		skip_json_ws(input, i);
 		if (i >= input.size() || input[i] != ':') {
 			error = "expected ':'";
 			return false;
 		}
 		i++;
-		skip_ws();
-		if (i >= input.size()) {
-			error = "expected JSON value";
+		if (!parse_json_value(input, i, value, error))
 			return false;
-		}
-		if (input[i] == '"') {
-			if (!parse_string(value))
-				return false;
-		} else {
-			size_t start = i;
-			while (i < input.size() && input[i] != ',' && input[i] != '}')
-				i++;
-			value = trim(input.substr(start, i - start));
-		}
-		out[key] = value;
-		skip_ws();
+		out.object_value[key] = value;
+		skip_json_ws(input, i);
 		if (i >= input.size()) {
 			error = "unterminated JSON object";
 			return false;
 		}
-		if (input[i] == '}')
+		if (input[i] == '}') {
+			i++;
 			return true;
+		}
 		if (input[i] != ',') {
 			error = "expected ','";
 			return false;
@@ -542,6 +564,99 @@ parse_simple_json_object(const std::string& input, std::map<std::string, std::st
 	}
 	error = "unterminated JSON object";
 	return false;
+}
+
+bool
+parse_json_array_value(const std::string& input, size_t& i, JsonValue& out, std::string& error)
+{
+	skip_json_ws(input, i);
+	if (i >= input.size() || input[i] != '[') {
+		error = "expected JSON array";
+		return false;
+	}
+	out.type = JsonValue::Type::Array;
+	out.array_value.clear();
+	i++;
+	skip_json_ws(input, i);
+	if (i < input.size() && input[i] == ']') {
+		i++;
+		return true;
+	}
+	while (i < input.size()) {
+		JsonValue value;
+		if (!parse_json_value(input, i, value, error))
+			return false;
+		out.array_value.push_back(std::move(value));
+		skip_json_ws(input, i);
+		if (i >= input.size()) {
+			error = "unterminated JSON array";
+			return false;
+		}
+		if (input[i] == ']') {
+			i++;
+			return true;
+		}
+		if (input[i] != ',') {
+			error = "expected ','";
+			return false;
+		}
+		i++;
+	}
+	error = "unterminated JSON array";
+	return false;
+}
+
+bool
+parse_json_value(const std::string& input, size_t& i, JsonValue& out, std::string& error)
+{
+	skip_json_ws(input, i);
+	if (i >= input.size()) {
+		error = "expected JSON value";
+		return false;
+	}
+	if (input[i] == '"') {
+		out.type = JsonValue::Type::String;
+		out.object_value.clear();
+		out.array_value.clear();
+		return parse_json_string_value(input, i, out.string_value, error);
+	}
+	if (input[i] == '{')
+		return parse_json_object_value(input, i, out, error);
+	if (input[i] == '[')
+		return parse_json_array_value(input, i, out, error);
+	error = "unsupported JSON value";
+	return false;
+}
+
+bool
+parse_json_root_object(const std::string& input, JsonValue& out, std::string& error)
+{
+	size_t i = 0;
+	if (!parse_json_object_value(input, i, out, error))
+		return false;
+	skip_json_ws(input, i);
+	if (i != input.size()) {
+		error = "unexpected trailing JSON content";
+		return false;
+	}
+	return true;
+}
+
+bool
+parse_simple_json_object(const std::string& input, std::map<std::string, std::string>& out, std::string& error)
+{
+	JsonValue root;
+	if (!parse_json_root_object(input, root, error))
+		return false;
+	out.clear();
+	for (const auto& [key, value] : root.object_value) {
+		if (value.type != JsonValue::Type::String) {
+			error = "expected string JSON value";
+			return false;
+		}
+		out[key] = value.string_value;
+	}
+	return true;
 }
 
 [[nodiscard]] std::string
@@ -1699,19 +1814,90 @@ private:
 		return out.str();
 	}
 
+	bool ParseSessionCreateRequest(
+	    const std::string& body,
+	    std::map<std::string, std::string>& params,
+	    std::map<std::string, ClientFeatureMapping>& manifest,
+	    std::string& error)
+	{
+		params.clear();
+		manifest.clear();
+		if (body.empty())
+			return true;
+		JsonValue root;
+		if (!parse_json_root_object(body, root, error))
+			return false;
+		for (const auto& [key, value] : root.object_value) {
+			if (key == "client_feature_manifest") {
+				if (value.type != JsonValue::Type::Array) {
+					error = "client_feature_manifest must be a JSON array";
+					return false;
+				}
+				for (const JsonValue& entry : value.array_value) {
+					if (entry.type != JsonValue::Type::Object) {
+						error = "client_feature_manifest entries must be JSON objects";
+						return false;
+					}
+					ClientFeatureMapping mapping;
+					std::string feature_id;
+					for (const auto& [entry_key, entry_value] : entry.object_value) {
+						if (entry_value.type != JsonValue::Type::String) {
+							error = "client_feature_manifest entry values must be JSON strings";
+							return false;
+						}
+						if (entry_key == "feature_id")
+							feature_id = entry_value.string_value;
+						else if (entry_key == "implementation_key")
+							mapping.implementation_key = entry_value.string_value;
+						else if (entry_key == "source_symbol")
+							mapping.source_symbol = entry_value.string_value;
+						else if (entry_key == "source_path")
+							mapping.source_path = entry_value.string_value;
+						else if (entry_key == "description")
+							mapping.description = entry_value.string_value;
+					}
+					if (feature_id.empty()) {
+						error = "client_feature_manifest entry missing feature_id";
+						return false;
+					}
+					if (mapping.implementation_key.empty() || mapping.source_symbol.empty() || mapping.source_path.empty() || mapping.description.empty()) {
+						error = "client_feature_manifest entry missing mapping metadata";
+						return false;
+					}
+					if (FindFeature(feature_id) == nullptr)
+						continue;
+					manifest[feature_id] = std::move(mapping);
+				}
+				continue;
+			}
+			if (value.type != JsonValue::Type::String) {
+				error = "expected string JSON value";
+				return false;
+			}
+			params[key] = value.string_value;
+		}
+		return true;
+	}
+
 	HttpResponse CreateSession(const std::string& body)
 	{
 		std::map<std::string, std::string> params;
+		std::map<std::string, ClientFeatureMapping> manifest;
 		std::string error;
-		if (!body.empty() && !parse_simple_json_object(body, params, error))
+		if (!ParseSessionCreateRequest(body, params, manifest, error))
 			return {400, json_error(error)};
 		auto session = std::make_shared<Session>();
 		session->id = RandomId();
 		session->agent_name = params["agent_name"];
 		session->environment_name = params["environment_name"];
 		session->created_at = Clock::now();
-		for (const FeatureDefinition& feature : feature_catalog_)
-			session->features.emplace(feature.id, std::make_shared<FeatureExecution>(&feature));
+		for (const FeatureDefinition& feature : feature_catalog_) {
+			auto execution = std::make_shared<FeatureExecution>(&feature);
+			auto it = manifest.find(feature.id);
+			if (it != manifest.end())
+				execution->client_mapping = it->second;
+			session->features.emplace(feature.id, std::move(execution));
+		}
 		{
 			std::lock_guard<std::mutex> lock(sessions_mutex_);
 			sessions_[session->id] = session;
@@ -1816,6 +2002,15 @@ private:
 		    << "\"evidence_kind\":" << json_quote(execution->evidence_kind) << ","
 		    << "\"evidence_text\":" << json_quote(execution->evidence_text) << ","
 		    << "\"report_text\":" << json_quote(execution->report_text);
+		if (execution->client_mapping.has_value()) {
+			const ClientFeatureMapping& mapping = *execution->client_mapping;
+			out << ",\"client_mapping\":{"
+			    << "\"implementation_key\":" << json_quote(mapping.implementation_key) << ","
+			    << "\"source_symbol\":" << json_quote(mapping.source_symbol) << ","
+			    << "\"source_path\":" << json_quote(mapping.source_path) << ","
+			    << "\"description\":" << json_quote(mapping.description)
+			    << "}";
+		}
 		if (include_contract && !execution->contract_json.empty())
 			out << ",\"contract\":" << execution->contract_json;
 		out << "}";
@@ -2525,6 +2720,38 @@ private:
       line-height: 1.45;
     }
 
+    .feature-mapping {
+      margin-top: 14px;
+      padding: 12px 13px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.56);
+    }
+
+    .mapping-row {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 8px;
+      font-size: 0.8rem;
+      line-height: 1.45;
+    }
+
+    .mapping-row + .mapping-row {
+      margin-top: 6px;
+    }
+
+    .mapping-label {
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 0.72rem;
+    }
+
+    .mapping-value {
+      overflow-wrap: anywhere;
+      font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
     .feature-time {
       margin-top: 16px;
       color: var(--muted);
@@ -2688,6 +2915,28 @@ private:
       `).join("");
     }
 
+    function renderClientMapping(feature) {
+      const mapping = feature.client_mapping;
+      if (!mapping) return "";
+      const rows = [
+        ["Implementation", mapping.implementation_key],
+        ["Go symbol", mapping.source_symbol],
+        ["Source", mapping.source_path],
+        ["Description", mapping.description],
+      ].filter(([, value]) => value);
+      if (rows.length === 0) return "";
+      return `
+        <div class="feature-mapping">
+          ${rows.map(([label, value]) => `
+            <div class="mapping-row">
+              <div class="mapping-label">${escapeHtml(label)}</div>
+              <div class="mapping-value">${escapeHtml(value)}</div>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    }
+
     function renderFeatures(summary) {
       const features = Array.isArray(summary.features) ? summary.features : [];
       emptyStateEl.hidden = features.length !== 0;
@@ -2703,6 +2952,7 @@ private:
               <div class="state-pill" data-tone="${tone}">${escapeHtml(feature.state)}</div>
             </div>
             <div class="feature-message">${escapeHtml(feature.message || "no status message")}</div>
+            ${renderClientMapping(feature)}
             <div class="feature-time">
               <div>Started: ${escapeHtml(formatTimestamp(feature.started_at))}</div>
               <div>Finished: ${escapeHtml(formatTimestamp(feature.finished_at))}</div>
