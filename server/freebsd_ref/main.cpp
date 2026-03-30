@@ -2163,6 +2163,7 @@ private:
 			    << "\"category\":" << json_quote(feature.category) << ","
 			    << "\"summary\":" << json_quote(feature.summary) << ","
 			    << "\"completion_mode\":" << json_quote(to_string(feature.completion_mode)) << ","
+			    << "\"manual_setup_required\":" << json_bool(feature.manual_setup_required) << ","
 			    << "\"timeout_seconds\":" << feature.timeout_seconds
 			    << "}";
 		}
@@ -2282,6 +2283,8 @@ private:
 		    << "\"title\":" << json_quote(execution->definition->title) << ","
 		    << "\"category\":" << json_quote(execution->definition->category) << ","
 		    << "\"completion_mode\":" << json_quote(to_string(execution->definition->completion_mode)) << ","
+		    << "\"manual_setup_required\":" << json_bool(execution->definition->manual_setup_required) << ","
+		    << "\"manual_setup_instructions\":" << json_array_strings(execution->definition->manual_setup_instructions) << ","
 		    << "\"state\":" << json_quote(to_string(execution->state)) << ","
 		    << "\"message\":" << json_quote(execution->message) << ","
 		    << "\"started_at\":" << json_quote(iso_time(execution->started_at)) << ","
@@ -3057,6 +3060,7 @@ private:
         <div>
           <h1 id="title">SCTP session</h1>
           <div class="subtitle" id="subtitle">Loading session metadata...</div>
+          <div class="note">Features marked as requiring manual host setup are opt-in. The Go client skips them by default unless you pass <code>--include-manual-setup</code> or explicitly select them with <code>--features</code>.</div>
         </div>
         <div class="connection" id="connection" data-state="reconnecting">loading</div>
       </div>
@@ -3179,6 +3183,17 @@ private:
       emptyStateEl.hidden = features.length !== 0;
       featureGridEl.innerHTML = features.map((feature) => {
         const tone = toneForState(feature.state);
+        const manualSetup = feature.manual_setup_required === true;
+        const manualNote = manualSetup
+          ? `
+            <div class="note">
+              Manual host setup required. This feature is skipped by default by the Go client.
+              ${(Array.isArray(feature.manual_setup_instructions) && feature.manual_setup_instructions.length > 0)
+                ? `<br>${feature.manual_setup_instructions.map((line) => escapeHtml(line)).join("<br>")}`
+                : ""}
+            </div>
+          `
+          : "";
         return `
           <article class="feature-card" data-tone="${tone}">
             <div class="feature-head">
@@ -3189,6 +3204,7 @@ private:
               <div class="state-pill" data-tone="${tone}">${escapeHtml(feature.state)}</div>
             </div>
             <div class="feature-message">${escapeHtml(feature.message || "no status message")}</div>
+            ${manualNote}
             <div class="feature-time">
               <div>Started: ${escapeHtml(formatTimestamp(feature.started_at))}</div>
               <div>Finished: ${escapeHtml(formatTimestamp(feature.finished_at))}</div>
