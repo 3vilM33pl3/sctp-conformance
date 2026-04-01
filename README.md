@@ -107,13 +107,17 @@ profile = "library"
 download-ci-llvm = false
 EOF
 python3 x.py build library/std --stage 1
+python3 x.py build library/proc_macro --stage 1
 RUSTC="$(pwd)/build/x86_64-unknown-linux-gnu/stage1/bin/rustc" \
 RUSTFLAGS="--sysroot=$(pwd)/build/x86_64-unknown-linux-gnu/stage1" \
 cargo run --manifest-path src/tools/sctp-feature-client/Cargo.toml -- --list-scenarios
 ```
 
 The first Rust build is heavy because it compiles LLVM locally and expects
-`cmake`, `ninja`, `clang`, and `c++` to be available on the Linux host.
+`cmake`, `ninja`, `clang`, and `c++` to be available on the Linux host. The
+extra `library/proc_macro` build is required because the feature client uses
+`serde_derive` and therefore needs a complete stage1 proc-macro toolchain, not
+just `library/std`.
 
 To drive the FreeBSD conformance server from the Rust client:
 
