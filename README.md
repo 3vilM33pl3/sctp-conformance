@@ -77,6 +77,21 @@ cd clients/go-sctp
 GOROOT=$(pwd) ./bin/go build ./misc/sctp-feature-client/go
 ```
 
+To build a FreeBSD client binary from the same checkout:
+
+```sh
+cd clients/go-sctp
+GO111MODULE=off GOROOT=$(pwd) GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 \
+  ./bin/go build -o /tmp/go-sctp-feature-client-freebsd ./misc/sctp-feature-client/go
+```
+
+That binary can then be copied to a FreeBSD 15 host and pointed at the
+reference server:
+
+```sh
+/tmp/go-sctp-feature-client-freebsd --base-url http://free.metatao.net:18080
+```
+
 The Rust feature client is built against the in-tree `std::net` SCTP API in
 `clients/rust-sctp`. In the published fork, the simplest reproducible setup is
 to disable CI LLVM downloads and let `x.py` build LLVM from the pinned
