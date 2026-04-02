@@ -41,9 +41,6 @@ constexpr int kBacklog = 16;
 constexpr size_t kBufferSize = 262144;
 constexpr uint8_t kSctpChunkAsconf = 0xc1;
 constexpr uint8_t kSctpChunkAsconfAck = 0x80;
-constexpr char kTransportProfileNative[] = "native";
-constexpr char kTransportProfileUDPEncap[] = "udp_encap";
-constexpr uint16_t kDefaultUDPEncapsulationPort = 9899;
 
 struct MessageSpec {
 	std::string payload;
@@ -186,7 +183,6 @@ struct Session {
 	std::string id;
 	std::string agent_name;
 	std::string environment_name;
-	std::string transport_profile = kTransportProfileNative;
 	Clock::time_point created_at {};
 	std::unordered_map<std::string, std::shared_ptr<FeatureExecution>> features;
 	std::string active_feature_id;
@@ -219,28 +215,6 @@ struct ListeningSocket {
 	std::vector<std::string> bind_addrs;
 	std::vector<std::string> advertise_addrs;
 };
-
-[[nodiscard]] bool
-is_valid_transport_profile(const std::string& value)
-{
-	return value == kTransportProfileNative || value == kTransportProfileUDPEncap;
-}
-
-[[nodiscard]] std::string
-normalize_transport_profile(const std::string& value)
-{
-	if (value.empty())
-		return kTransportProfileNative;
-	return value;
-}
-
-[[nodiscard]] std::string
-contract_transport_for_profile(const std::string& transport_profile)
-{
-	if (transport_profile == kTransportProfileUDPEncap)
-		return "sctp4_udp_encap";
-	return "sctp4";
-}
 
 [[nodiscard]] std::string
 trim(const std::string& value)
@@ -586,17 +560,6 @@ json_one_to_many_contract(const OneToManyContract& config)
 	    << "\"expected_associations\":" << config.expected_associations << ","
 	    << "\"same_socket_required\":" << json_bool(config.same_socket_required) << ","
 	    << "\"require_distinct_assoc_ids\":" << json_bool(config.require_distinct_assoc_ids)
-	    << "}";
-	return out.str();
-}
-
-[[nodiscard]] std::string
-json_udp_encapsulation_contract(uint16_t remote_port)
-{
-	std::ostringstream out;
-	out << "{"
-	    << "\"remote_port\":" << remote_port << ","
-	    << "\"rfc\":\"6951\""
 	    << "}";
 	return out.str();
 }
@@ -2620,9 +2583,6 @@ private:
 		session->id = RandomId();
 		session->agent_name = params["agent_name"];
 		session->environment_name = params["environment_name"];
-		session->transport_profile = normalize_transport_profile(params["transport_profile"]);
-		if (!is_valid_transport_profile(session->transport_profile))
-			return {400, json_error("transport_profile must be \"native\" or \"udp_encap\"")};
 		session->created_at = Clock::now();
 		for (const FeatureDefinition& feature : feature_catalog_) {
 			auto execution = std::make_shared<FeatureExecution>(&feature);
@@ -2643,7 +2603,6 @@ private:
 		    << "\"session_id\":" << json_quote(session->id) << ","
 		    << "\"agent_name\":" << json_quote(session->agent_name) << ","
 		    << "\"environment_name\":" << json_quote(session->environment_name) << ","
-		    << "\"transport_profile\":" << json_quote(session->transport_profile) << ","
 		    << "\"created_at\":" << json_quote(iso_time(session->created_at)) << ","
 		    << "\"active_feature_id\":" << json_quote(session->active_feature_id) << ","
 		    << "\"dashboard_path\":" << json_quote(DashboardPath(session->id)) << ","
@@ -2704,7 +2663,6 @@ private:
 		std::ostringstream out;
 		out << "{"
 		    << "\"session_id\":" << json_quote(session->id) << ","
-		    << "\"transport_profile\":" << json_quote(session->transport_profile) << ","
 		    << "\"passed\":" << passed << ","
 		    << "\"failed\":" << failed << ","
 		    << "\"unsupported\":" << unsupported << ","
@@ -2840,7 +2798,6 @@ private:
 			std::string id;
 			std::string agent_name;
 			std::string environment_name;
-			std::string transport_profile;
 			std::string created_at;
 			std::string active_feature_id;
 			std::string dashboard_path;
@@ -2859,7 +2816,6 @@ private:
 					card.id = session->id;
 					card.agent_name = session->agent_name;
 					card.environment_name = session->environment_name;
-					card.transport_profile = session->transport_profile;
 					card.created_at = iso_time(session->created_at);
 					card.created_at_point = session->created_at;
 					card.active_feature_id = session->active_feature_id;
@@ -2903,9 +2859,6 @@ private:
 				        << "<div class=\"session-body\">"
 				        << "<div class=\"row\"><span class=\"label\">Created</span><span class=\"value\">"
 				        << html_escape(card.created_at.empty() ? "unknown" : card.created_at)
-				        << "</span></div>"
-				        << "<div class=\"row\"><span class=\"label\">Transport</span><span class=\"value\">"
-				        << html_escape(card.transport_profile.empty() ? kTransportProfileNative : card.transport_profile)
 				        << "</span></div>"
 				        << "<div class=\"row\"><span class=\"label\">Feature</span><span class=\"value\">"
 				        << html_escape(active ? card.active_feature_id : "none")
@@ -3557,10 +3510,6 @@ private:
           <div class="value" id="environment-name">loading</div>
         </section>
         <section class="panel">
-          <div class="label">Transport</div>
-          <div class="value" id="transport-profile">loading</div>
-        </section>
-        <section class="panel">
           <div class="label">Active Feature</div>
           <div class="value" id="active-feature">none</div>
         </section>
@@ -3594,7 +3543,6 @@ private:
     const subtitleEl = document.getElementById("subtitle");
     const agentEl = document.getElementById("agent-name");
     const environmentEl = document.getElementById("environment-name");
-    const transportProfileEl = document.getElementById("transport-profile");
     const activeFeatureEl = document.getElementById("active-feature");
     const countsEl = document.getElementById("counts");
     const featureGridEl = document.getElementById("feature-grid");
@@ -3725,7 +3673,6 @@ private:
       sessionIdEl.textContent = session.session_id || sessionId;
       agentEl.textContent = session.agent_name || "unlabeled";
       environmentEl.textContent = session.environment_name || "unlabeled";
-      transportProfileEl.textContent = session.transport_profile || "native";
       activeFeatureEl.textContent = session.active_feature_id || "none";
     }
 
@@ -3816,7 +3763,7 @@ private:
 				std::lock_guard<std::mutex> session_lock(session->mutex);
 				session->active_feature_id = execution->definition->id;
 			}
-			contract = build_contract(*session, *execution->definition, {});
+			contract = build_contract(*execution->definition, {});
 		} else if (execution->definition->scenario_kind == ScenarioKind::ReceiveMessages ||
 		    execution->definition->scenario_kind == ScenarioKind::ReceiveMessagesMultiTarget ||
 		    execution->definition->scenario_kind == ScenarioKind::ReceivePRMessages) {
@@ -3849,7 +3796,7 @@ private:
 					std::lock_guard<std::mutex> session_lock(session->mutex);
 					session->active_feature_id = execution->definition->id;
 				}
-				contract = build_contract(*session, *execution->definition, connect_addrs);
+				contract = build_contract(*execution->definition, connect_addrs);
 				run_receive_multi_target_worker(session, execution, std::move(fds), execution->definition->client_send_messages);
 			} else {
 				auto socket_info = create_listening_socket(options_, execution->definition->bind_address_count, execution->definition->timeout_seconds, error);
@@ -3861,7 +3808,7 @@ private:
 					std::lock_guard<std::mutex> session_lock(session->mutex);
 					session->active_feature_id = execution->definition->id;
 				}
-				contract = build_contract(*session, *execution->definition, socket_info->advertise_addrs);
+				contract = build_contract(*execution->definition, socket_info->advertise_addrs);
 				if (execution->definition->scenario_kind == ScenarioKind::ReceivePRMessages) {
 					run_pr_receive_worker(session, execution, socket_info->fd, execution->definition->client_send_messages);
 				} else {
@@ -3883,7 +3830,7 @@ private:
 				std::lock_guard<std::mutex> session_lock(session->mutex);
 				session->active_feature_id = execution->definition->id;
 			}
-			contract = build_contract(*session, *execution->definition, socket_info->advertise_addrs);
+			contract = build_contract(*execution->definition, socket_info->advertise_addrs);
 			run_send_after_trigger_worker(session, execution, socket_info->fd, execution->definition->trigger_payload, execution->definition->server_send_messages);
 		}
 		{
@@ -3911,14 +3858,13 @@ private:
 		execution->deadline_at = execution->started_at + std::chrono::seconds(execution->definition->timeout_seconds);
 	}
 
-	std::string build_contract(const Session& session, const FeatureDefinition& feature, const std::vector<std::string>& connect_addrs) const
+	std::string build_contract(const FeatureDefinition& feature, const std::vector<std::string>& connect_addrs) const
 	{
 		std::ostringstream out;
-		const std::string transport_profile = normalize_transport_profile(session.transport_profile);
 		out << "{"
 		    << "\"feature_id\":" << json_quote(feature.id) << ","
 		    << "\"completion_mode\":" << json_quote(to_string(feature.completion_mode)) << ","
-		    << "\"transport\":" << json_quote(contract_transport_for_profile(transport_profile)) << ","
+		    << "\"transport\":\"sctp4\","
 		    << "\"connect_addresses\":" << json_array_strings(connect_addrs) << ","
 		    << "\"client_socket_options\":" << json_array_strings(feature.client_socket_options) << ","
 		    << "\"client_subscriptions\":" << json_array_strings(feature.client_subscriptions) << ","
@@ -3943,8 +3889,6 @@ private:
 			out << ",\"socket_tuning\":" << json_socket_tuning_contract(*feature.socket_tuning);
 		if (feature.one_to_many)
 			out << ",\"one_to_many\":" << json_one_to_many_contract(*feature.one_to_many);
-		if (transport_profile == kTransportProfileUDPEncap)
-			out << ",\"udp_encapsulation\":" << json_udp_encapsulation_contract(kDefaultUDPEncapsulationPort);
 		out << "}";
 		return out.str();
 	}

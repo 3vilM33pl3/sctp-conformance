@@ -77,24 +77,6 @@ cd clients/go-sctp
 GOROOT=$(pwd) ./bin/go build ./misc/sctp-feature-client/go
 ```
 
-The client can request either the default native SCTP server profile or the
-new UDP-encapsulation profile. The default remains native:
-
-```sh
-cd clients/go-sctp
-GOROOT=$(pwd) ./bin/go run ./misc/sctp-feature-client/go \
-  --base-url http://free.metatao.net:18080
-```
-
-To request the RFC 6951 UDP-encapsulation profile explicitly:
-
-```sh
-cd clients/go-sctp
-GOROOT=$(pwd) ./bin/go run ./misc/sctp-feature-client/go \
-  --base-url http://free.metatao.net:18080 \
-  --transport-profile udp_encap
-```
-
 To build a FreeBSD client binary from the same checkout:
 
 ```sh
@@ -173,7 +155,6 @@ Run the server:
 - `--advertise-addrs` are the addresses returned in feature contracts.
 - One active feature is allowed per session.
 - All state is in memory only.
-- `POST /v1/sessions` accepts `transport_profile` with `native` or `udp_encap`.
 
 ## Manual Prerequisites
 

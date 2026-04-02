@@ -52,18 +52,11 @@ Optional flat JSON body:
 ```json
 {
   "agent_name": "codex-cli",
-  "environment_name": "go-sctp",
-  "transport_profile": "native"
+  "environment_name": "go-sctp"
 }
 ```
 
-`transport_profile` accepts:
-
-- `native`
-- `udp_encap`
-
-The response includes `session_id`, the per-feature session snapshot, `dashboard_path`,
-and the resolved `transport_profile`.
+The response includes `session_id`, the per-feature session snapshot, and `dashboard_path`.
 
 ### `GET /v1/sessions/{sessionId}`
 
@@ -72,7 +65,6 @@ Returns the current session metadata, including:
 - `session_id`
 - `agent_name`
 - `environment_name`
-- `transport_profile`
 - `created_at`
 - `active_feature_id`
 - `dashboard_path`
@@ -91,8 +83,6 @@ Each feature card includes one or more RFC links derived from the server-side fe
 Starts one feature in the session and returns a scenario contract containing:
 
 - SCTP addresses to connect to
-- a transport identifier such as `sctp4` or `sctp4_udp_encap`
-- optional `udp_encapsulation` metadata for RFC 6951 sessions
 - an invalid target for negative-path features
 - required client socket options
 - required subscriptions
